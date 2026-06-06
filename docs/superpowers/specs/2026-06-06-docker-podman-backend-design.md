@@ -4,7 +4,7 @@ Date: 2026-06-06
 
 ## Goal
 
-Add Docker sandbox (`sbx`) and Podman (libkrun driver) as alternative backends to UTM for running lightweight, headless Linux development environments. These backends use pre-built environment images (Alpine-based) with no GUI, no SSH daemon — all operations go through `sbx exec` / `podman exec`.
+Add Docker sandbox (`sbx`) and Podman (libkrun driver) as alternative backends to UTM for running lightweight, headless Linux development environments. These backends use user-defined environment profiles (YAML) to generate container images with no GUI, no SSH daemon — all operations go through `sbx exec` / `podman exec`.
 
 ## Decisions
 
@@ -13,37 +13,131 @@ Add Docker sandbox (`sbx`) and Podman (libkrun driver) as alternative backends t
 | Docker backend | `sbx` CLI (Docker Sandboxes) — microVM isolation |
 | Podman backend | `podman` CLI with libkrun VM driver |
 | Container operations | `sbx exec` / `podman exec` only — no SSH inside container |
-| Environment images | Pre-built Alpine images per language (Go, Node, PHP, Python, base) |
-| Rootfs security | `--read-only` + tmpfs for /tmp, /run, /var/tmp |
+| Environment definition | User-defined YAML profiles, committed to git, shared across teams |
+| Image generation | Dockerfile generated from profile YAML at build time |
+| Rootfs security | `--read-only` + tmpfs for /tmp, /run, /var/tmp (podman) |
 | Persistence | Named volumes for `/home/vm` and `/home/linuxbrew/.linuxbrew` |
 | File sharing | `-v` bind mounts at container start |
 | Port forwarding | `-p` port mapping (podman) / `sbx ports --publish` (sbx) |
-| Multi-container | One config = one container. Multiple projects use separate config dirs |
-| Runtime package installs | Via Homebrew (persisted) or language package managers (npm, pip, go install → user home) |
+| Multi-container | One config = one container. Multiple projects share environment profiles |
+| Runtime package installs | Via Homebrew (persisted) or language package managers (→ user home volume) |
 | Architecture approach | Backend interface + dispatch |
 
-## Pre-built Environment Images
+## Environment Profiles
 
-Images live in `images/` directory as Dockerfiles. Built with `agent-vm build-image` or pulled from registry.
+Environments are **user-defined YAML files** that describe what goes into a container image. They live in `~/.config/agent-vm/profiles/` and can be committed to git for team sharing.
 
-### Available environments
+### Profile YAML schema
 
-| Image | Contents |
-|---|---|
-| `agent-vm-base` | Alpine + bash + fish/zsh + neovim/helix + git + sudo + Homebrew + fnm + Docker CLI + compose + buildx |
-| `agent-vm-go` | base + Go latest + gopls + dlv + staticcheck |
-| `agent-vm-node` | base + Node.js LTS (fnm) + pnpm + yarn |
-| `agent-vm-php` | base + PHP + Composer + Symfony CLI + phpunit |
-| `agent-vm-python` | base + Python 3 + pip + uv + venv |
+```yaml
+# ~/.config/agent-vm/profiles/go.yaml
+name: go
+description: "Go development environment"
 
-### Image structure (Dockerfile template)
+base: alpine:latest
+
+system_packages:
+  - go
+  - gopls
+  - delve
+
+brew_packages:
+  - golangci-lint
+  - goreleaser
+
+post_install: |
+  go install golang.org/x/tools/gopls@latest
+  go install github.com/go-delve/delve/cmd/dlv@latest
+
+env:
+  GOPATH: /home/vm/go
+  PATH: "$PATH:/home/vm/go/bin"
+```
+
+```yaml
+# ~/.config/agent-vm/profiles/php-symfony.yaml
+name: php-symfony
+description: "PHP + Symfony development environment"
+
+base: alpine:latest
+
+system_packages:
+  - php83
+  - php83-cli
+  - php83-json
+  - php83-openssl
+  - php83-pdo
+  - php83-mbstring
+  - php83-xml
+  - php83-curl
+  - composer
+
+brew_packages: []
+
+post_install: |
+  curl -1sLf 'https://dl.cloudsmith.io/public/symfony/stable/setup.alpine.sh' | sudo sh
+  sudo apk add symfony-cli
+
+env:
+  PATH: "$PATH:/home/vm/.composer/vendor/bin"
+```
+
+```yaml
+# ~/.config/agent-vm/profiles/node.yaml
+name: node
+description: "Node.js development environment"
+
+base: alpine:latest
+
+system_packages: []
+
+brew_packages:
+  - pnpm
+  - yarn
+
+post_install: |
+  # fnm already installed by base layer; install latest LTS
+  eval "$(fnm env)"
+  fnm install --lts
+  fnm default lts-latest
+
+env: {}
+```
+
+### Profile schema definition
+
+```yaml
+name: string           # required — profile name, used as image tag prefix
+description: string    # optional — human-readable description
+base: string           # required — base image (default: alpine:latest)
+system_packages: []    # optional — apk packages to install
+brew_packages: []      # optional — Homebrew packages to install
+post_install: string   # optional — shell script to run after package installation
+env: map               # optional — environment variables to set
+```
+
+### Profile resolution order
+
+When `vmctl.yaml` references `environment: go`:
+
+1. `~/.config/agent-vm/profiles/go.yaml` (user local)
+2. `./profiles/go.yaml` (project-local, committed to git)
+3. Error: profile not found
+
+This allows teams to:
+- Share profiles via git (commit `profiles/` to project repo)
+- Override team defaults with local customizations in `~/.config/agent-vm/profiles/`
+
+### Dockerfile generation from profile
+
+`agent-vm build-image --profile go` generates a Dockerfile from the profile and the base config (shell, editor, timezone, git identity from `vmctl.yaml`):
 
 ```dockerfile
 FROM alpine:latest
 
-# System packages
+# Base system packages (always present)
 RUN apk add --no-cache bash git curl wget sudo ca-certificates tzdata \
-    build-base <shell-pkg> <editor-pkg>
+    build-base <shell-pkg> <editor-pkg> docker-cli
 
 # User: non-root, no root login
 RUN adduser -D -s /bin/<shell> vm && \
@@ -54,24 +148,35 @@ RUN adduser -D -s /bin/<shell> vm && \
 RUN cp /usr/share/zoneinfo/<timezone> /etc/localtime && \
     echo "<timezone>" > /etc/timezone
 
-# Homebrew (installed to /home/linuxbrew)
-RUN /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" && \
+# Homebrew
+RUN adduser -D -s /bin/bash linuxbrew && \
+    su - linuxbrew -c '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"' && \
     echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/vm/.profile
 
-# fnm + Node.js LTS
+# fnm (for all environments — Node.js is universal)
 USER vm
-RUN curl -fsSL https://fnm.vercel.app/install | bash && \
-    /home/vm/.local/share/fnm/fnm install --lts
+RUN curl -fsSL https://fnm.vercel.app/install | bash
 
-# Docker CLI + compose + buildx
+# Profile: system_packages
 USER root
-RUN apk add --no-cache docker-cli && \
-    mkdir -p /usr/libexec/docker/cli-plugins && \
-    curl -fsSL ... -o /usr/libexec/docker/cli-plugins/docker-compose && \
-    curl -fsSL ... -o /usr/libexec/docker/cli-plugins/docker-buildx
+RUN apk add --no-cache <system_packages from profile>
 
-# <environment-specific packages>
-# e.g. for Go: RUN go install golang.org/x/tools/gopls@latest ...
+# Profile: brew_packages
+RUN su - linuxbrew -c 'brew install <brew_packages from profile>'
+
+# Profile: post_install script
+USER vm
+RUN <post_install from profile>
+
+# Docker compose + buildx plugins
+USER root
+RUN mkdir -p /usr/libexec/docker/cli-plugins && \
+    curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-aarch64" \
+      -o /usr/libexec/docker/cli-plugins/docker-compose && \
+    chmod 0755 /usr/libexec/docker/cli-plugins/docker-compose && \
+    curl -fsSL "https://github.com/docker/buildx/releases/latest/download/buildx-v0.24.0.linux-arm64" \
+      -o /usr/libexec/docker/cli-plugins/docker-buildx && \
+    chmod 0755 /usr/libexec/docker/cli-plugins/docker-buildx
 
 # Git config
 USER vm
@@ -80,66 +185,133 @@ RUN git config --global core.editor <editor> && \
     git config --global pull.rebase false && \
     git config --global push.autoSetupRemote true
 
+# Profile: env vars
+ENV <env from profile>
+
 # Default directories
-RUN mkdir -p /home/vm/repos /home/vm/projects
+USER vm
+RUN mkdir -p ~/repos ~/projects
 
 # Entrypoint
 COPY entrypoint.sh /entrypoint.sh
+USER root
 ENTRYPOINT ["/entrypoint.sh"]
+CMD ["sleep", "infinity"]
 ```
 
 Entrypoint (`entrypoint.sh`):
 ```bash
 #!/bin/sh
-# Initialize named volumes on first run
-for vol in /home/vm /home/linuxbrew/.linuxbrew; do
-  if [ ! -f "${vol}/.vmctl-initialized" ]; then
-    # Volume is empty — nothing to copy, just mark initialized
-    touch "${vol}/.vmctl-initialized"
-  fi
-done
 exec "$@"
 ```
 
-Default CMD: `sleep infinity`
+### Sharing profiles via git
+
+Teams commit `profiles/` to their project or organization repo:
+
+```
+my-org/dev-envs/
+├── profiles/
+│   ├── go.yaml
+│   ├── php-symfony.yaml
+│   ├── node.yaml
+│   └── python.yaml
+├── README.md
+```
+
+Each developer clones this repo and symlinks or copies profiles:
+```bash
+git clone git@github.com:my-org/dev-envs.git ~/.config/agent-vm/profiles
+# or per-project:
+ln -s /path/to/project/profiles ./profiles
+```
+
+### Multiple projects sharing one environment
+
+```yaml
+# ~/projects/service-a/vmctl.yaml
+backend: podman
+environment: go
+ports:
+  - host: 3001
+    guest: 3000
+
+# ~/projects/service-b/vmctl.yaml
+backend: podman
+environment: go
+ports:
+  - host: 3002
+    guest: 3000
+
+# ~/projects/api/vmctl.yaml
+backend: podman
+environment: php-symfony
+ports:
+  - host: 8000
+    guest: 8000
+```
+
+All three containers use the same built image (`agent-vm-go` or `agent-vm-php-symfony`). Each has its own:
+- Container name (derived from `vm.name`)
+- Named volumes (`<name>_home`, `<name>_brew`)
+- Port mappings
+- Bind mounts
+
+Image is built once, reused by all containers referencing the same environment.
 
 ### Build command
 
-```
-agent-vm build-image [--env base|go|node|php|python]
+```bash
+agent-vm build-image --profile go
+# Generates Dockerfile, builds image tagged as agent-vm-go
+# Uses podman or docker depending on backend in vmctl.yaml
+
+# Build all profiles referenced in current config
+agent-vm build-image --all
+
+# Build from a specific profile file
+agent-vm build-image --file /path/to/my-profile.yaml
 ```
 
-Generates Dockerfile from config + environment template, builds image locally.
+Image naming: `agent-vm-<profile.name>`.
+
+Users can also use a pre-built or third-party image directly:
+```yaml
+backend: podman
+image: my-registry/my-dev-env:latest   # skip profile, use image directly
+```
+
+When `image:` is set, profile is ignored. When `environment:` is set, image is derived from profile name.
 
 ## Config Changes
 
-### New YAML fields
+### New YAML fields in `vmctl.yaml`
 
 ```yaml
-backend: utm           # "utm" | "sbx" | "podman"
-image: agent-vm-base   # environment image (only for sbx/podman)
+backend: utm                    # "utm" | "sbx" | "podman"
+environment: go                 # profile name (only for sbx/podman, mutually exclusive with image:)
+# image: my-custom-image:latest # or use a pre-built image directly
 
 # Only used when backend is sbx or podman:
 volumes:
-  - name: projects                # bind mount for file sharing
+  - name: projects
     host_path: /Users/me/projects
     mount: /home/vm/projects
 
 ports:
   - host: 3000
     guest: 3000
-  - host: 8080
-    guest: 80
 ```
 
-Named volumes are auto-created: `<name>_home` → `/home/vm`, `<name>_brew` → `/home/linuxbrew/.linuxbrew`. Not configurable — always present for container backends.
+Named volumes are auto-created: `<name>_home` → `/home/vm`, `<name>_brew` → `/home/linuxbrew/.linuxbrew`. Always present for container backends, not user-configurable.
 
 ### Config struct changes
 
 New fields in `Config`:
 - `Backend string` — `"utm"`, `"sbx"`, or `"podman"`
 - `ContainerName string` — derived from `Name` (e.g., `agent-vm-void-dev`)
-- `Image string` — environment image name
+- `Environment string` — profile name
+- `Image string` — resolved image name (derived from profile or set directly)
 - `Volumes []VolumeMount` — user-defined bind mounts
 - `PortMappings []PortMapping` — host:guest port pairs
 
@@ -147,7 +319,7 @@ New types:
 ```go
 type VolumeMount struct {
     Name     string
-    HostPath string // empty for named volumes, set for bind mounts
+    HostPath string // set for bind mounts
     Mount    string
 }
 
@@ -157,12 +329,14 @@ type PortMapping struct {
 }
 ```
 
+Existing UTM-only fields remain but are only populated when `Backend == "utm"`.
+
 ### Validation
 
 `validateConfig()` branches on `cfg.Backend`:
 - **UTM**: validates WM (lxqt/xfce), network fields, checks `utmctl` binary
-- **sbx**: checks `sbx` binary, validates image exists
-- **podman**: checks `podman` binary, validates image exists, validates port mappings, validates libkrun driver
+- **sbx**: checks `sbx` binary, validates profile or image exists
+- **podman**: checks `podman` binary, validates profile or image exists, validates port mappings, validates libkrun driver
 
 `WindowManager` validation only runs when `Backend == "utm"`.
 
@@ -193,7 +367,7 @@ func NewBackend(cfg Config) Backend
 |---|---|---|
 | `UTMBackend` | `utmctl` | SSH-based operations, GUI VM |
 | `SBXBackend` | `sbx` | `sbx create/exec/stop/rm/ports`, microVM isolation |
-| `PodmanBackend` | `podman` | `podman run/exec/stop/rm`, libkrun VM driver, `--read-only` + security flags |
+| `PodmanBackend` | `podman` | `podman run/exec/stop/rm`, libkrun, `--read-only` + security flags |
 
 ### UTMBackend
 
@@ -207,8 +381,8 @@ Uses `sbx` CLI (Docker Sandboxes):
 - `sbx stop <name>` — stop sandbox
 - `sbx rm <name>` — remove sandbox
 - `sbx ports <name> --publish host:guest` — port forwarding
-- Bootstrap: run setup script via `sbx exec`
 - Persistence: sbx sandboxes persist state across stops; removed on `sbx rm`
+- Image/Environment: sbx sandboxes have their own environment setup. Profile's `post_install` runs via `sbx exec` after creation.
 
 ### PodmanBackend
 
@@ -239,18 +413,18 @@ Uses `podman` CLI with security hardening:
 
 ### Layer 3: No root access
 - Image disables root login (`passwd -l root`)
-- Container runs as user `vm`
+- Container runs as user `vm` (`--user vm`)
 - sudo available for specific operations but no root shell
 
 ### Layer 4: Persistent writable paths (named volumes only)
-- `agent-vm-<name>_home` → `/home/vm` (user data, configs, projects)
+- `agent-vm-<name>_home` → `/home/vm` (user data, configs, projects, go/bin, .npm, etc.)
 - `agent-vm-<name>_brew` → `/home/linuxbrew/.linuxbrew` (Homebrew packages)
 - User-defined bind mounts for project files
 
 ### Runtime package installation
 - No `apk` at runtime (rootfs is read-only)
 - Homebrew (`brew install`) → persisted in brew volume
-- Language package managers (`go install`, `npm i -g`, `pip install`) → go to user home volume
+- Language package managers (`go install`, `npm i -g`, `pip install --user`) → go to user home volume
 - These persist across container recreations
 
 ## Container Lifecycle
@@ -260,8 +434,8 @@ Uses `podman` CLI with security hardening:
 1. Check `sbx` binary exists
 2. Check if sandbox already exists: `sbx ls`
 3. If not exists: `sbx create --name <name> .`
-4. `sbx run <name>` (starts sandbox)
-5. If no bootstrap marker: run setup via `sbx exec`, write marker
+4. If sandbox not running: `sbx run <name>` (starts sandbox)
+5. If no bootstrap marker: run profile's `post_install` via `sbx exec`, then hook scripts, write marker
 6. Set up port forwarding: `sbx ports <name> --publish host:guest`
 
 ### SBXBackend.Stop()
@@ -280,13 +454,27 @@ Uses `podman` CLI with security hardening:
 ### PodmanBackend.Start()
 
 1. Check `podman` binary exists, verify libkrun driver
-2. Check if image exists: `podman image inspect <image>`
-3. If not: return error (user must `build-image` first)
-4. Check if container exists: `podman inspect <containerName>`
-5. If container exists but stopped: `podman start <containerName>`
-6. If no container: `podman run -d --name <containerName> --read-only --cap-drop=ALL --security-opt no-new-privileges --pids-limit 4096 --tmpfs /tmp:rw,noexec,nosuid --tmpfs /run:rw,noexec,nosuid --tmpfs /var/tmp:rw,noexec,nosuid -v <name>_home:/home/vm -v <name>_brew:/home/linuxbrew/.linuxbrew [-p ports] [-v volumes] <image>`
-7. If no bootstrap marker: run hook scripts via `podman exec`, write marker
-8. Start auto-tunnel equivalents (port mappings)
+2. Resolve image name from `environment` profile or `image` field
+3. Check if image exists: `podman image inspect <image>`
+4. If not: return error (user must `build-image` first)
+5. Check if container exists: `podman inspect <containerName>`
+6. If container exists but stopped: `podman start <containerName>`
+7. If no container:
+   ```
+   podman run -d --name <containerName> \
+     --read-only --cap-drop=ALL \
+     --security-opt no-new-privileges \
+     --pids-limit 4096 \
+     --tmpfs /tmp:rw,noexec,nosuid \
+     --tmpfs /run:rw,noexec,nosuid \
+     --tmpfs /var/tmp:rw,noexec,nosuid \
+     -v <name>_home:/home/vm \
+     -v <name>_brew:/home/linuxbrew/.linuxbrew \
+     [-p host:guest ...] \
+     [-v host_path:container_path ...] \
+     <image>
+   ```
+8. If no bootstrap marker: run hook scripts via `podman exec`, write marker
 
 ### PodmanBackend.Stop()
 
@@ -348,7 +536,7 @@ Dropdown at top of bootstrap modal: `UTM`, `Docker (sbx)`, `Podman`. Changing it
 | Memory (MiB) | shown | shown |
 | Disk Size | shown | **hidden** |
 | Guest IP | shown | **hidden** |
-| Environment Image | **hidden** | shown (dropdown: base, go, node, php, python) |
+| Environment | **hidden** | shown (dropdown: profiles from `profiles/` dir) |
 | Hook Scripts | shown | shown |
 | Git name/email | shown | shown |
 | Port Mappings | **hidden** | shown |
@@ -367,38 +555,40 @@ Dropdown at top of bootstrap modal: `UTM`, `Docker (sbx)`, `Podman`. Changing it
 
 ## Build Image Command
 
-```
-agent-vm build-image [--env base|go|node|php|python]
-```
+```bash
+# Build from a profile
+agent-vm build-image --profile go
+# Generates Dockerfile from profiles/go.yaml + base config, builds image agent-vm-go
 
-1. Generate Dockerfile from config + environment template
-2. `podman build -t agent-vm-<env> <stateDir>/` (or `docker build`)
-3. Tag image
+# Build all profiles referenced in current vmctl.yaml
+agent-vm build-image --all
 
-Users can also bring their own image — just set `image: my-custom-image` in config.
+# Build from a specific file
+agent-vm build-image --file /path/to/my-profile.yaml
+
+# Uses podman or docker depending on what's available
+```
 
 ## Files Changed
 
 | File | Change |
 |---|---|
-| `internal/vmctl/config.go` | Add `Backend`, `Image`, `ContainerName`, `Volumes`, `PortMappings`; backend-aware validation |
-| `internal/vmctl/yaml_config.go` | Parse `backend:`, `image:`, `volumes:`, `ports:` |
+| `internal/vmctl/config.go` | Add `Backend`, `Environment`, `Image`, `ContainerName`, `Volumes`, `PortMappings`; backend-aware validation |
+| `internal/vmctl/yaml_config.go` | Parse `backend:`, `environment:`, `image:`, `volumes:`, `ports:` |
+| `internal/vmctl/profile.go` | **New** — `EnvironmentProfile` struct, YAML loading, profile resolution |
+| `internal/vmctl/dockerfile.go` | **New** — Dockerfile generation from profile + config |
 | `internal/vmctl/backend.go` | **New** — `Backend` interface, `NewBackend()` factory |
 | `internal/vmctl/backend_utm.go` | **New** — `UTMBackend` (moves code from vm.go, inspect.go) |
 | `internal/vmctl/backend_sbx.go` | **New** — `SBXBackend` (sbx CLI) |
 | `internal/vmctl/backend_podman.go` | **New** — `PodmanBackend` (podman CLI + security) |
-| `internal/vmctl/image.go` | **New** — Dockerfile generation, `BuildImage()` |
-| `images/base/Dockerfile` | **New** — base environment image |
-| `images/go/Dockerfile` | **New** — Go environment image |
-| `images/node/Dockerfile` | **New** — Node.js environment image |
-| `images/php/Dockerfile` | **New** — PHP environment image |
-| `images/python/Dockerfile` | **New** — Python environment image |
 | `internal/vmctl/vm.go` | Trimmed — delegates to backend |
 | `internal/vmctl/inspect.go` | Trimmed — delegates to backend |
 | `internal/vmctl/cobra.go` | `build-image` command, backend-aware commands |
-| `internal/vmctl/web_handlers.go` | Backend-aware handlers |
-| `web/static/app.js` | Conditional UI, backend selector, image dropdown |
+| `internal/vmctl/web_handlers.go` | Backend-aware handlers, profile listing |
+| `web/static/app.js` | Conditional UI, backend selector, environment dropdown |
 | `web/static/index.html` | Backend selector, port/volume inputs |
+| `internal/vmctl/profile_test.go` | **New** — profile parsing tests |
+| `internal/vmctl/dockerfile_test.go` | **New** — Dockerfile generation tests |
 
 ## Acceptance Criteria
 
@@ -409,11 +599,13 @@ Users can also bring their own image — just set `image: my-custom-image` in co
 5. No SSH daemon inside containers
 6. `sbx exec` / `podman exec` for all container operations
 7. Named volumes persist `/home/vm` and `/home/linuxbrew/.linuxbrew` across recreations
-8. Pre-built environment images available: base, go, node, php, python
-9. `build-image` command generates and builds images
-10. Port mappings in config map to `-p` / `sbx ports`
-11. Volume mounts in config map to `-v` bind mounts
-12. Web UI hides WM/desktop when backend is sbx/podman
-13. Web UI shows environment image selector, port mappings, volume mounts
-14. Root login disabled in container images
-15. `go build ./...` and `go test ./internal/vmctl/...` pass
+8. Users define environments via YAML profiles in `profiles/` directory
+9. Profiles are resolved from `./profiles/` (project-local, git-shared) or `~/.config/agent-vm/profiles/` (user-local)
+10. `build-image --profile <name>` generates Dockerfile from profile and builds image
+11. Multiple `vmctl.yaml` configs can reference the same environment — image built once, shared
+12. Port mappings in config map to `-p` / `sbx ports`
+13. Volume mounts in config map to `-v` bind mounts
+14. Web UI hides WM/desktop when backend is sbx/podman
+15. Web UI shows environment dropdown populated from `profiles/` directory
+16. Root login disabled in container images
+17. `go build ./...` and `go test ./internal/vmctl/...` pass
