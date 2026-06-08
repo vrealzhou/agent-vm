@@ -8,18 +8,18 @@ import (
 )
 
 type bootstrapScriptData struct {
-	GuestUser      string
-	GuestHome      string
-	DefaultShell   string
-	DefaultEditor  string
-	EditorCmd      string
-	WindowManager  string
-	HomebrewPrefix string
-	GitUserName    string
-	GitUserEmail   string
-	Timezone       string
-	VoidRepoURL    string
-	ExtraCommands  string
+	GuestUser       string
+	GuestHome       string
+	DefaultShell    string
+	DefaultEditor   string
+	EditorCmd       string
+	WindowManager   string
+	HomebrewPrefix  string
+	GitUserName     string
+	GitUserEmail    string
+	Timezone        string
+	VoidRepoURL     string
+	ExtraCommands   string
 	SetDefaultShell bool
 }
 
@@ -34,18 +34,18 @@ func editorCmd(editor string) string {
 
 func generateBootstrapScript(cfg Config) (string, error) {
 	data := bootstrapScriptData{
-		GuestUser:      cfg.GuestUser,
-		GuestHome:      "/home/" + cfg.GuestUser,
-		DefaultShell:   cfg.DefaultShell,
-		DefaultEditor:  cfg.DefaultEditor,
-		EditorCmd:      editorCmd(cfg.DefaultEditor),
-		WindowManager:  cfg.WindowManager,
-		HomebrewPrefix: "/home/linuxbrew/.linuxbrew",
-		GitUserName:    cfg.GitUserName,
-		GitUserEmail:   cfg.GitUserEmail,
-		Timezone:       cfg.Timezone,
-		VoidRepoURL:    strings.TrimRight(cfg.VoidRepository, "/") + "/current/aarch64",
-		ExtraCommands:  cfg.BootstrapExtraCommands,
+		GuestUser:       cfg.GuestUser,
+		GuestHome:       "/home/" + cfg.GuestUser,
+		DefaultShell:    cfg.DefaultShell,
+		DefaultEditor:   cfg.DefaultEditor,
+		EditorCmd:       editorCmd(cfg.DefaultEditor),
+		WindowManager:   cfg.WindowManager,
+		HomebrewPrefix:  "/home/linuxbrew/.linuxbrew",
+		GitUserName:     cfg.GitUserName,
+		GitUserEmail:    cfg.GitUserEmail,
+		Timezone:        cfg.Timezone,
+		VoidRepoURL:     strings.TrimRight(cfg.VoidRepository, "/") + "/current/aarch64",
+		ExtraCommands:   cfg.BootstrapExtraCommands,
 		SetDefaultShell: cfg.SetDefaultShell,
 	}
 
@@ -76,8 +76,6 @@ GIT_USER_EMAIL="{{.GitUserEmail}}"
 FISH_CONFIG_DIR="${TARGET_HOME}/.config/fish"
 FISH_CONFIG_SNIPPET="${FISH_CONFIG_DIR}/conf.d/vmctl-shell.fish"
 FISH_SESSION_AUTOSTART_SNIPPET="${FISH_CONFIG_DIR}/conf.d/vmctl-session-autostart.fish"
-LEGACY_OMP_THEME_DIR="${TARGET_HOME}/.config/oh-my-posh"
-LEGACY_OMP_SNIPPET="${FISH_CONFIG_DIR}/conf.d/oh-my-posh.fish"
 ZSHRC_PATH="${TARGET_HOME}/.zshrc"
 ZPROFILE_PATH="${TARGET_HOME}/.zprofile"
 BASH_PROFILE_PATH="${TARGET_HOME}/.bash_profile"
@@ -150,14 +148,14 @@ validate_choices() {
     *) die "unsupported DEFAULT_EDITOR: ${DEFAULT_EDITOR}" ;;
   esac
   case "${WINDOW_MANAGER}" in
-    sway|xfce) ;;
+    lxqt|xfce) ;;
     *) die "unsupported WINDOW_MANAGER: ${WINDOW_MANAGER}" ;;
   esac
 }
 
 install_packages() {
   if command -v xbps-install >/dev/null 2>&1; then
-    local xbps_args=(-Sy fish-shell zsh curl unzip ca-certificates xz bash git wget file sudo chrony neovim gcc ghostty ghostty-terminfo mesa mesa-dri xorg xfce4 xfce4-terminal fcitx5 fcitx5-chinese-addons fcitx5-configtool fcitx5-gtk+2 fcitx5-gtk+3 fcitx5-gtk4 fcitx5-qt5 fcitx5-qt6 noto-fonts-cjk noto-fonts-emoji)
+    local xbps_args=(-Sy fish-shell zsh curl unzip ca-certificates xz bash git wget file sudo chrony neovim gcc docker make lxqt openbox ghostty ghostty-terminfo mesa mesa-dri xorg xfce4 xfce4-terminal fcitx5 fcitx5-chinese-addons fcitx5-configtool fcitx5-gtk+2 fcitx5-gtk+3 fcitx5-gtk4 fcitx5-qt5 fcitx5-qt6 noto-fonts-cjk noto-fonts-emoji spice-vdagent)
     if [[ -n "${BOOTSTRAP_XBPS_REPOSITORY}" ]]; then
       xbps_args=(-R "${BOOTSTRAP_XBPS_REPOSITORY}" "${xbps_args[@]}")
     fi
@@ -272,16 +270,8 @@ setup_docker() {
 }
 
 cleanup_legacy_prompt_config() {
-  rm -rf "${LEGACY_OMP_THEME_DIR}"
-  rm -f "${LEGACY_OMP_SNIPPET}" "${LOCAL_BIN_DIR}/oh-my-posh"
-}
-
-write_starship_config() {
-  retry_as_target_shell "
-    export HOME=${TARGET_HOME@Q}
-    mkdir -p \$(dirname ${STARSHIP_CONFIG_PATH@Q})
-    curl -fsSL --retry 5 --retry-delay 2 --retry-connrefused ${STARSHIP_PRESET_URL@Q} -o ${STARSHIP_CONFIG_PATH@Q}
-  "
+  rm -rf "${TARGET_HOME}/.config/oh-my-posh"
+  rm -f "${FISH_CONFIG_DIR}/conf.d/oh-my-posh.fish" "${LOCAL_BIN_DIR}/oh-my-posh"
 }
 
 write_git_config() {
@@ -321,7 +311,6 @@ set -gx XDG_RUNTIME_DIR \$HOME/.local/run
 mkdir -p \$XDG_RUNTIME_DIR
 chmod 700 \$XDG_RUNTIME_DIR
 set -gx PATH \$HOME/.local/bin \$PATH
-set -gx PATH \$HOME/.cargo/bin \$PATH
 set -gx EDITOR {{.EditorCmd}}
 set -gx VISUAL {{.EditorCmd}}
 set -gx GTK_IM_MODULE fcitx
@@ -334,10 +323,6 @@ end
 if command -q fnm
   fnm env --use-on-cd --shell fish | source
 end
-set -gx STARSHIP_CONFIG \$HOME/.config/starship.toml
-if command -q starship
-  starship init fish | source
-end
 FISHEOF
 }
 
@@ -345,7 +330,7 @@ write_fish_autostart() {
   mkdir -p "${FISH_CONFIG_DIR}/conf.d"
   cat >"${FISH_SESSION_AUTOSTART_SNIPPET}" <<'FISHEOF'
 if status is-interactive
-  if test -z "$WAYLAND_DISPLAY"; and test -z "$DISPLAY"
+  if test -z "$DISPLAY"
     if string match -q /dev/tty1 (tty 2>/dev/null)
       exec /usr/local/bin/vmctl-session
     end
@@ -359,7 +344,7 @@ export COLORTERM=truecolor
 export XDG_RUNTIME_DIR="\${HOME}/.local/run"
 mkdir -p "\${XDG_RUNTIME_DIR}"
 chmod 700 "\${XDG_RUNTIME_DIR}"
-export PATH="\${HOME}/.local/bin:\${HOME}/.cargo/bin:\${PATH}"
+export PATH="\${HOME}/.local/bin:\${PATH}"
 export EDITOR={{.EditorCmd}}
 export VISUAL={{.EditorCmd}}
 export GTK_IM_MODULE=fcitx
@@ -372,10 +357,6 @@ fi
 if command -v fnm >/dev/null 2>&1; then
   eval "\$(fnm env --use-on-cd --shell zsh)"
 fi
-export STARSHIP_CONFIG="\${HOME}/.config/starship.toml"
-if command -v starship >/dev/null 2>&1; then
-  eval "\$(starship init zsh)"
-fi
 ZSHEOF
 }
 
@@ -384,7 +365,7 @@ write_zsh_autostart() {
 export XDG_RUNTIME_DIR="${HOME}/.local/run"
 mkdir -p "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
+if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
   exec /usr/local/bin/vmctl-session
 fi
 ZSHEOF
@@ -394,7 +375,7 @@ write_bash_profile() {
 export XDG_RUNTIME_DIR="${HOME}/.local/run"
 mkdir -p "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
+if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
   exec /usr/local/bin/vmctl-session
 fi
 BASHEOF
@@ -497,50 +478,7 @@ install_zen_browser() {
 
 write_session_wrapper() {
   as_root mkdir -p /usr/local/bin
-{{if eq .WindowManager "sway"}}
-  as_root tee /usr/local/bin/vmctl-session >/dev/null <<'SESSIONEOF'
-#!/bin/sh
-export XDG_CURRENT_DESKTOP=sway
-export XDG_SESSION_TYPE=wayland
-export WLR_RENDERER=pixman
-export WLR_NO_HARDWARE_CURSORS=1
-export GTK_IM_MODULE=fcitx
-export QT_IM_MODULE=fcitx
-export SDL_IM_MODULE=fcitx
-export XMODIFIERS=@im=fcitx
-export XDG_RUNTIME_DIR="${HOME}/.local/run"
-mkdir -p "${XDG_RUNTIME_DIR}"
-chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-  exec dbus-run-session sh -lc '
-    sway &
-    sway_pid=$!
-    for _ in $(seq 1 100); do
-      sock=$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name "wayland-*" | head -n 1)
-      if [ -n "${sock}" ]; then
-        export WAYLAND_DISPLAY=$(basename "${sock}")
-        break
-      fi
-      sleep 0.1
-    done
-    fcitx5 -d -r >/tmp/fcitx5.log 2>&1 || true
-    wait "${sway_pid}"
-  '
-fi
-sway &
-sway_pid=$!
-for _ in $(seq 1 100); do
-  sock=$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name "wayland-*" | head -n 1)
-  if [ -n "${sock}" ]; then
-    export WAYLAND_DISPLAY=$(basename "${sock}")
-    break
-  fi
-  sleep 0.1
-done
-fcitx5 -d -r >/tmp/fcitx5.log 2>&1 || true
-wait "${sway_pid}"
-SESSIONEOF
-{{else}}
+{{if eq .WindowManager "xfce"}}
   as_root tee /usr/local/bin/vmctl-session >/dev/null <<'SESSIONEOF'
 #!/bin/sh
 export XDG_CURRENT_DESKTOP=XFCE
@@ -557,6 +495,24 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
   exec dbus-run-session startxfce4
 fi
 exec startxfce4
+SESSIONEOF
+{{else}}
+  as_root tee /usr/local/bin/vmctl-session >/dev/null <<'SESSIONEOF'
+#!/bin/sh
+export XDG_CURRENT_DESKTOP=LXQt
+export XDG_SESSION_DESKTOP=lxqt
+export XDG_SESSION_TYPE=x11
+export GTK_IM_MODULE=fcitx
+export QT_IM_MODULE=fcitx
+export SDL_IM_MODULE=fcitx
+export XMODIFIERS=@im=fcitx
+export XDG_RUNTIME_DIR="${HOME}/.local/run"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+  exec dbus-run-session startlxqt
+fi
+exec startlxqt
 SESSIONEOF
 {{end}}
   as_root chmod 0755 /usr/local/bin/vmctl-session
@@ -631,26 +587,6 @@ StartupWMClass=zen
 ZENDESKEOF
 }
 
-write_swaybar_status() {
-  as_root mkdir -p /usr/local/bin
-  as_root tee /usr/local/bin/vmctl-swaybar-status >/dev/null <<'BAREOF'
-#!/bin/sh
-printf '{"version":1}\n[\n[]\n'
-while :; do
-  im_name="$(fcitx5-remote -n 2>/dev/null || true)"
-  case "${im_name}" in
-    pinyin) im_label="中" ;;
-    keyboard-us|"") im_label="EN" ;;
-    *) im_label="${im_name}" ;;
-  esac
-  time_text="$(date '+%Y-%m-%d %H:%M:%S')"
-  printf ',[{"name":"input","full_text":"IM: %s"},{"name":"time","full_text":"%s"}]\n' "${im_label}" "${time_text}"
-  sleep 1
-done
-BAREOF
-  as_root chmod 0755 /usr/local/bin/vmctl-swaybar-status
-}
-
 configure_timezone() {
   if [[ -n "${BOOTSTRAP_TIMEZONE}" ]] && [[ -e "/usr/share/zoneinfo/${BOOTSTRAP_TIMEZONE}" ]]; then
     as_root ln -snf "/usr/share/zoneinfo/${BOOTSTRAP_TIMEZONE}" /etc/localtime
@@ -664,42 +600,12 @@ configure_time_sync() {
     retry 5 as_root sv restart chronyd || retry 5 as_root sv start chronyd
   fi
 }
-{{if eq .WindowManager "sway"}}
-write_window_manager_config() {
-  as_root mkdir -p /etc/sway/config.d
-  as_root tee /etc/sway/config.d/10-vmctl.conf >/dev/null <<'SWAYEOF'
-set $term ghostty
-unbindsym $mod+Return
-bindsym $mod+Return exec $term
-set $menu wofi --show drun
-unbindsym $mod+d
-bindsym $mod+d exec $menu
-input type:pointer {
-    natural_scroll enabled
-}
-input type:touchpad {
-    natural_scroll enabled
-}
-SWAYEOF
-  as_root tee /etc/sway/config.d/20-vmctl-bar.conf >/dev/null <<'SWAYBAREOF'
-bar bar-0 {
-    tray_output *
-    status_command /usr/local/bin/vmctl-swaybar-status
-}
-SWAYBAREOF
-}
-{{end}}
 
 fix_ownership() {
   if [[ "$(id -un)" != "${TARGET_USER}" ]]; then
     as_root chown -R "${TARGET_USER}:$(id -gn "${TARGET_USER}")" \
       "${TARGET_HOME}/.local" \
-      "${TARGET_HOME}/.cargo" \
-      "${TARGET_HOME}/.rustup" \
       "${FISH_CONFIG_DIR}"
-    if [[ -e "${STARSHIP_CONFIG_PATH}" ]]; then
-      as_root chown "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${STARSHIP_CONFIG_PATH}"
-    fi
     for path in "${TARGET_HOME}/.gitconfig" "${ZSHRC_PATH}" "${ZPROFILE_PATH}" "${BASH_PROFILE_PATH}"; do
       if [[ -e "${path}" ]]; then
         as_root chown "${TARGET_USER}:$(id -gn "${TARGET_USER}")" "${path}"
@@ -726,15 +632,12 @@ set_default_shell() {
 main() {
   validate_choices
   install_packages
-  install_rust
   install_homebrew
-  install_starship
   install_fnm_and_node
   ensure_default_editor_installed
   install_zen_browser
   setup_docker
   cleanup_legacy_prompt_config
-  write_starship_config
   write_git_config
   write_fish_config
   write_fish_autostart
@@ -746,12 +649,8 @@ main() {
   write_session_wrapper
   write_chromium_wrapper
   write_zen_wrapper
-  write_swaybar_status
   configure_timezone
   configure_time_sync
-{{if eq .WindowManager "sway"}}
-  write_window_manager_config
-{{end}}
   fix_ownership
   set_default_shell
   mkdir -p ${TARGET_HOME}/repos ${TARGET_HOME}/projects
@@ -763,7 +662,7 @@ VMCTLHOOKEOF
   bash /tmp/vmctl-hooks.sh || log "hooks completed with warnings"
   rm -f /tmp/vmctl-hooks.sh
 {{end}}
-  log "configured ${DEFAULT_SHELL}, ${DEFAULT_EDITOR}, ${WINDOW_MANAGER}, fnm, Starship, Rust, Homebrew tools, Docker, Ghostty, Zen Browser, Chromium, Fcitx5 Chinese input, timezone, and time sync for ${TARGET_USER}"
+  log "configured ${DEFAULT_SHELL}, ${DEFAULT_EDITOR}, ${WINDOW_MANAGER}, fnm, Homebrew, Docker, Ghostty, Zen Browser, Chromium, Fcitx5 Chinese input, timezone, and time sync for ${TARGET_USER}"
 }
 
 main "$@"

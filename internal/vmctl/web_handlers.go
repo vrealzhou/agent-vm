@@ -26,12 +26,13 @@ func handleStatus(cfg Config) echo.HandlerFunc {
 		if err != nil {
 			return jsonError(c, http.StatusInternalServerError, err.Error())
 		}
-		status, err := InspectVM(cfg)
+		backend := NewBackend(cfg)
+		status, err := backend.Status(cfg)
 		if err != nil {
 			return jsonError(c, http.StatusInternalServerError, err.Error())
 		}
 		var metrics *GuestMetrics
-		if status.Running {
+		if status.Running && (cfg.Backend == "" || cfg.Backend == "utm") {
 			sample, err := SampleGuestMetrics(cfg)
 			if err == nil {
 				calculated := CalculateGuestMetrics(sample, nil)
@@ -42,15 +43,20 @@ func handleStatus(cfg Config) echo.HandlerFunc {
 			"status":  status,
 			"metrics": metrics,
 			"config": map[string]any{
+				"backend":       cfg.Backend,
 				"shell":         cfg.DefaultShell,
 				"editor":        cfg.DefaultEditor,
 				"windowManager": cfg.WindowManager,
 				"memoryMiB":     cfg.MemoryMiB,
 				"diskSize":      cfg.DiskSize,
 				"staticIP":      cfg.StaticIP,
-				"hookScripts": cfg.BootstrapHookScripts,
+				"hookScripts":   cfg.BootstrapHookScripts,
 				"userName":      cfg.GitUserName,
 				"userEmail":     cfg.GitUserEmail,
+				"environment":   cfg.Environment,
+				"image":         cfg.Image,
+				"ports":         cfg.PortMappings,
+				"volumes":       cfg.Volumes,
 			},
 		})
 	}
@@ -58,15 +64,19 @@ func handleStatus(cfg Config) echo.HandlerFunc {
 
 func handleBootstrap(cfg Config) echo.HandlerFunc {
 	type bootstrapReq struct {
-		Shell         string `json:"shell"`
-		Editor        string `json:"editor"`
-		WindowManager string `json:"windowManager"`
-		MemoryMiB     int    `json:"memoryMiB"`
-		DiskSize      string `json:"diskSize"`
-		StaticIP     string   `json:"staticIP"`
-		HookScripts  []string `json:"hookScripts"`
-		UserName      string `json:"userName"`
-		UserEmail     string `json:"userEmail"`
+		Shell         string         `json:"shell"`
+		Editor        string         `json:"editor"`
+		WindowManager string         `json:"windowManager"`
+		Backend       string         `json:"backend"`
+		MemoryMiB     int            `json:"memoryMiB"`
+		DiskSize      string         `json:"diskSize"`
+		StaticIP      string         `json:"staticIP"`
+		HookScripts   []string       `json:"hookScripts"`
+		UserName      string         `json:"userName"`
+		UserEmail     string         `json:"userEmail"`
+		Environment   string         `json:"environment"`
+		Ports         []PortMapping  `json:"ports"`
+		Volumes       []VolumeMount  `json:"volumes"`
 	}
 	return func(c *echo.Context) error {
 		var req bootstrapReq
@@ -76,6 +86,9 @@ func handleBootstrap(cfg Config) echo.HandlerFunc {
 		newCfg, err := LoadConfig()
 		if err != nil {
 			return jsonError(c, http.StatusInternalServerError, err.Error())
+		}
+		if req.Backend != "" {
+			newCfg.Backend = req.Backend
 		}
 		if req.Shell != "" {
 			newCfg.DefaultShell = req.Shell
@@ -94,6 +107,15 @@ func handleBootstrap(cfg Config) echo.HandlerFunc {
 		}
 		if req.StaticIP != "" {
 			newCfg.StaticIP = req.StaticIP
+		}
+		if req.Environment != "" {
+			newCfg.Environment = req.Environment
+		}
+		if len(req.Ports) > 0 {
+			newCfg.PortMappings = req.Ports
+		}
+		if len(req.Volumes) > 0 {
+			newCfg.Volumes = req.Volumes
 		}
 		if len(req.HookScripts) > 0 {
 			var parts []string
@@ -120,7 +142,8 @@ func handleBootstrap(cfg Config) echo.HandlerFunc {
 			return jsonError(c, http.StatusInternalServerError, err.Error())
 		}
 		go func() {
-			if err := BootstrapSetup(newCfg); err != nil {
+			backend := NewBackend(newCfg)
+			if err := backend.BootstrapSetup(newCfg); err != nil {
 				addProgress("bootstrap failed: %v", err)
 				fmt.Printf("bootstrap error: %v\n", err)
 			} else {
@@ -134,11 +157,11 @@ func handleBootstrap(cfg Config) echo.HandlerFunc {
 func handleStart(cfg Config) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		go func() {
-			if err := Start(cfg); err != nil {
+			if err := NewBackend(cfg).Start(cfg); err != nil {
 				addProgress("start failed: %v", err)
 				fmt.Printf("start error: %v\n", err)
 			} else {
-				addProgress("VM started")
+				addProgress("started")
 			}
 		}()
 		return jsonSuccess(c, map[string]string{"message": "start initiated"})
@@ -148,11 +171,11 @@ func handleStart(cfg Config) echo.HandlerFunc {
 func handleStop(cfg Config) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		go func() {
-			if err := Stop(cfg); err != nil {
+			if err := NewBackend(cfg).Stop(cfg); err != nil {
 				addProgress("stop failed: %v", err)
 				fmt.Printf("stop error: %v\n", err)
 			} else {
-				addProgress("VM stopped")
+				addProgress("stopped")
 			}
 		}()
 		return jsonSuccess(c, map[string]string{"message": "stop initiated"})
@@ -162,11 +185,11 @@ func handleStop(cfg Config) echo.HandlerFunc {
 func handleDestroy(cfg Config) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		go func() {
-			if err := Destroy(cfg); err != nil {
+			if err := NewBackend(cfg).Destroy(cfg); err != nil {
 				addProgress("destroy failed: %v", err)
 				fmt.Printf("destroy error: %v\n", err)
 			} else {
-				addProgress("VM destroyed")
+				addProgress("destroyed")
 			}
 		}()
 		return jsonSuccess(c, map[string]string{"message": "destroy initiated"})

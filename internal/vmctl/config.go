@@ -7,19 +7,28 @@ import (
 	"strings"
 )
 
+type VolumeMount struct {
+	Name     string `yaml:"name"`
+	HostPath string `yaml:"host_path"`
+	Mount    string `yaml:"mount"`
+}
+
+type PortMapping struct {
+	Host  int `yaml:"host"`
+	Guest int `yaml:"guest"`
+}
+
 type Config struct {
 	RepoRoot               string
 	Name                   string
+	Backend                string
+	ContainerName          string
 	StateDir               string
+	UTMBundlePath          string
 	DiskPath               string
 	KernelPath             string
 	InitrdPath             string
 	BootstrapMarker        string
-	EFIVarsPath            string
-	PIDFile                string
-	RestSocket             string
-	LogFile                string
-	SerialLog              string
 	CPUs                   int
 	MemoryMiB              int
 	DiskSize               string
@@ -44,17 +53,20 @@ type Config struct {
 	SetDefaultShell        bool
 	BootstrapExtraCommands string
 	BootstrapHookScripts   []string
+	Environment            string
+	Image                  string
 	VoidRepository         string
 	ImageDir               string
 	BaseImage              string
 	BaseImageURL           string
-	BuildKernelURL         string
 	GUI                    bool
 	Width                  int
 	Height                 int
 	ConfigDir              string
 	SyncPairs              []SyncPair
 	Tunnels                []Tunnel
+	Volumes                []VolumeMount
+	PortMappings           []PortMapping
 }
 
 func LoadConfig() (Config, error) {
@@ -96,28 +108,19 @@ func LoadConfig() (Config, error) {
 
 	stateDir := filepath.Join(configDir, vcfg.VM.Name)
 	imageDir := filepath.Join(configDir, "images")
+	utmBundlePath := stateDir + ".utm"
+	containerName := "agent-vm-" + vcfg.VM.Name
 
 	cfg := Config{
 		ConfigDir:              configDir,
 		Name:                   vcfg.VM.Name,
+		Backend:                vcfg.Backend,
+		ContainerName:          containerName,
 		StateDir:               stateDir,
-		DiskPath:               filepath.Join(stateDir, "disk.img"),
-		KernelPath:             filepath.Join(stateDir, "vmlinuz"),
-		InitrdPath:             filepath.Join(stateDir, "initramfs.img"),
 		BootstrapMarker:        filepath.Join(stateDir, "bootstrap.done"),
-		EFIVarsPath:            filepath.Join(stateDir, "efi-vars.fd"),
-		PIDFile:                filepath.Join(stateDir, "vfkit.pid"),
-		RestSocket:             filepath.Join(stateDir, "vfkit.sock"),
-		LogFile:                filepath.Join(stateDir, "vfkit.log"),
-		SerialLog:              filepath.Join(stateDir, "serial.log"),
 		CPUs:                   vcfg.VM.CPUs,
 		MemoryMiB:              vcfg.VM.MemoryMiB,
 		DiskSize:               vcfg.VM.DiskSize,
-		MAC:                    vcfg.Network.MAC,
-		StaticIP:               vcfg.Network.StaticIP,
-		Gateway:                vcfg.Network.Gateway,
-		CIDR:                   vcfg.Network.CIDR,
-		DNSServers:             dnsServersStr,
 		SSHUser:                vcfg.User.Name,
 		GuestUser:              vcfg.User.Name,
 		GuestPassword:          vcfg.User.Password,
@@ -134,22 +137,42 @@ func LoadConfig() (Config, error) {
 		SetDefaultShell:        true,
 		BootstrapExtraCommands: extraCommands,
 		BootstrapHookScripts:   vcfg.Bootstrap.HookScripts,
+		Environment:            vcfg.Environment,
+		Image:                  vcfg.Image,
 		VoidRepository:         "https://repo-default.voidlinux.org",
 		ImageDir:               imageDir,
 		BaseImage:              "",
 		BaseImageURL:           "",
-		BuildKernelURL:         "",
-		GUI:                    *vcfg.VM.GUI,
-		Width:                  vcfg.VM.Width,
-		Height:                 vcfg.VM.Height,
 		SyncPairs:              vcfg.Sync,
 		Tunnels:                vcfg.Tunnels,
+		Volumes:                vcfg.Volumes,
+		PortMappings:           vcfg.PortMappings,
+	}
+	if cfg.Backend == "utm" || cfg.Backend == "" {
+		cfg.UTMBundlePath = utmBundlePath
+		cfg.DiskPath = filepath.Join(utmBundlePath, "Data", "disk.img")
+		cfg.KernelPath = filepath.Join(utmBundlePath, "Data", "vmlinuz")
+		cfg.InitrdPath = filepath.Join(utmBundlePath, "Data", "initramfs.img")
+		cfg.MAC = vcfg.Network.MAC
+		cfg.StaticIP = vcfg.Network.StaticIP
+		cfg.Gateway = vcfg.Network.Gateway
+		cfg.CIDR = vcfg.Network.CIDR
+		cfg.DNSServers = dnsServersStr
+		cfg.GUI = *vcfg.VM.GUI
+		cfg.Width = vcfg.VM.Width
+		cfg.Height = vcfg.VM.Height
 	}
 	if cfg.Width == 0 {
 		cfg.Width = 1920
 	}
 	if cfg.Height == 0 {
 		cfg.Height = 1200
+	}
+	if (cfg.Backend == "sbx" || cfg.Backend == "podman") && cfg.Image == "" && cfg.Environment != "" {
+		profile, err := ResolveProfile(cfg.ConfigDir, cfg.Environment)
+		if err == nil {
+			cfg.Image = ProfileImageName(profile)
+		}
 	}
 
 	if err := validateConfig(cfg); err != nil {
@@ -169,7 +192,7 @@ Options:
 
 Commands:
   start      Create missing assets and start the VM
-  stop       Stop the VM via vfkit REST API
+  stop       Stop the VM (UTM, Docker, or Podman)
   destroy    Stop the VM and remove generated VM state and disk files
   status     Show VM state and effective network target
   gui        Open the web VM control panel
@@ -179,6 +202,11 @@ Commands:
   sync       Manage file sync pairs between host and VM
   tunnel     Manage SSH tunnels
 
+Backends:
+  utm        Apple Virtualization Framework via UTM (default)
+  sbx        Docker Sandboxes
+  podman     Podman with libkrun
+
 Configuration: %s/vmctl.yaml
 Override with: VMCTL_CONFIG_DIR=/custom/path
 
@@ -186,23 +214,37 @@ Defaults:
   VM:          6 CPU / 6144 MiB RAM / 100 GiB disk / 1920x1200
   Network:     192.168.64.10 / gateway 192.168.64.1
   User:        vm / password dev, root password root
-  Shell:       fish, editor: neovim, WM: sway
+  Shell:       fish, editor: neovim, WM: xfce
 
 `, cfg.ConfigDir)
 }
 
 func validateConfig(cfg Config) error {
-	validShells := map[string]bool{"fish": true, "zsh": true}
-	if !validShells[cfg.DefaultShell] {
-		return fmt.Errorf("invalid default_shell %q: must be fish or zsh", cfg.DefaultShell)
-	}
-	validEditors := map[string]bool{"neovim": true, "helix": true}
-	if !validEditors[cfg.DefaultEditor] {
-		return fmt.Errorf("invalid default_editor %q: must be neovim or helix", cfg.DefaultEditor)
-	}
-	validWMs := map[string]bool{"sway": true, "xfce": true}
-	if !validWMs[cfg.WindowManager] {
-		return fmt.Errorf("invalid window_manager %q: must be sway or xfce", cfg.WindowManager)
+	switch cfg.Backend {
+	case "", "utm":
+		validShells := map[string]bool{"fish": true, "zsh": true}
+		if !validShells[cfg.DefaultShell] {
+			return fmt.Errorf("invalid default_shell %q: must be fish or zsh", cfg.DefaultShell)
+		}
+		validEditors := map[string]bool{"neovim": true, "helix": true}
+		if !validEditors[cfg.DefaultEditor] {
+			return fmt.Errorf("invalid default_editor %q: must be neovim or helix", cfg.DefaultEditor)
+		}
+		validWMs := map[string]bool{"lxqt": true, "xfce": true}
+		if !validWMs[cfg.WindowManager] {
+			return fmt.Errorf("invalid window_manager %q: must be lxqt or xfce", cfg.WindowManager)
+		}
+	case "sbx", "podman":
+		validShells := map[string]bool{"fish": true, "zsh": true}
+		if !validShells[cfg.DefaultShell] {
+			return fmt.Errorf("invalid default_shell %q: must be fish or zsh", cfg.DefaultShell)
+		}
+		validEditors := map[string]bool{"neovim": true, "helix": true}
+		if !validEditors[cfg.DefaultEditor] {
+			return fmt.Errorf("invalid default_editor %q: must be neovim or helix", cfg.DefaultEditor)
+		}
+	default:
+		return fmt.Errorf("invalid backend %q: must be utm, sbx, or podman", cfg.Backend)
 	}
 	return nil
 }
@@ -214,6 +256,7 @@ func SaveConfig(cfg Config) error {
 	yamlPath := filepath.Join(cfg.ConfigDir, "vmctl.yaml")
 
 	vcfg := VMConfigFile{}
+	vcfg.Backend = cfg.Backend
 	vcfg.VM.Name = cfg.Name
 	vcfg.VM.CPUs = cfg.CPUs
 	vcfg.VM.MemoryMiB = cfg.MemoryMiB
@@ -235,8 +278,12 @@ func SaveConfig(cfg Config) error {
 	vcfg.Guest.WindowManager = cfg.WindowManager
 	vcfg.Git.UserName = cfg.GitUserName
 	vcfg.Git.UserEmail = cfg.GitUserEmail
+	vcfg.Environment = cfg.Environment
+	vcfg.Image = cfg.Image
 	vcfg.Sync = cfg.SyncPairs
 	vcfg.Tunnels = cfg.Tunnels
+	vcfg.Volumes = cfg.Volumes
+	vcfg.PortMappings = cfg.PortMappings
 
 	if cfg.DNSServers != "" {
 		vcfg.Network.DNSServers = strings.Fields(cfg.DNSServers)

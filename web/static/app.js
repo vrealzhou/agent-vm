@@ -189,30 +189,78 @@ els.filepickerOverlay.querySelector('.modal-close').onclick = () => els.filepick
 els.btnBootstrap.onclick = () => {
     const c = (currentStatus && currentStatus.config) || {};
     const sel = (id, val, opts) => opts.map(o => `<option${o === val ? ' selected' : ''}>${o}</option>`).join('');
-    showModal('Bootstrap Preferences', `
+    const backend = c.backend || 'utm';
+    const isContainer = backend === 'sbx' || backend === 'podman';
+
+    let fields = `
+        <div class="form-group"><label>Backend</label><select id="bootstrap-backend">${sel('bootstrap-backend', backend, ['utm', 'sbx', 'podman'])}</select></div>
         <div class="form-group"><label>Default shell</label><select id="bootstrap-shell">${sel('bootstrap-shell', c.shell || 'fish', ['fish', 'zsh'])}</select></div>
-        <div class="form-group"><label>Default editor</label><select id="bootstrap-editor">${sel('bootstrap-editor', c.editor || 'neovim', ['neovim', 'helix'])}</select></div>
-        <div class="form-group"><label>Window manager</label><select id="bootstrap-wm">${sel('bootstrap-wm', c.windowManager || 'sway', ['sway', 'xfce'])}</select></div>
-        <div class="form-group"><label>Memory (MiB)</label><input id="bootstrap-memory" type="number" placeholder="6144" value="${c.memoryMiB || 6144}"></div>
+        <div class="form-group"><label>Default editor</label><select id="bootstrap-editor">${sel('bootstrap-editor', c.editor || 'neovim', ['neovim', 'helix'])}</select></div>`;
+
+    if (!isContainer) {
+        fields += `<div class="form-group"><label>Window manager</label><select id="bootstrap-wm">${sel('bootstrap-wm', c.windowManager || 'xfce', ['lxqt', 'xfce'])}</select></div>`;
+    }
+
+    fields += `<div class="form-group"><label>Memory (MiB)</label><input id="bootstrap-memory" type="number" placeholder="6144" value="${c.memoryMiB || 6144}"></div>`;
+
+    if (!isContainer) {
+        fields += `
         <div class="form-group"><label>Disk size</label><input id="bootstrap-disk" placeholder="100G" value="${c.diskSize || '100G'}"></div>
-        <div class="form-group"><label>Guest IP address</label><input id="bootstrap-ip" placeholder="192.168.64.10" value="${c.staticIP || '192.168.64.10'}"></div>
-        <div class="form-group"><label>Hook scripts (one path per line)</label><textarea id="bootstrap-hook-scripts" rows="5" placeholder="/path/to/hooks.sh">${Array.isArray(c.hookScripts) ? c.hookScripts.join('\n') : (c.hookScripts || '')}</textarea></div>
+        <div class="form-group"><label>Guest IP address</label><input id="bootstrap-ip" placeholder="192.168.64.10" value="${c.staticIP || '192.168.64.10'}"></div>`;
+    }
+
+    if (isContainer) {
+        fields += `
+        <div class="form-group"><label>Environment / Image</label><input id="bootstrap-environment" placeholder="e.g. go, node, php-symfony" value="${c.environment || ''}"></div>
+        <div class="form-group"><label>Port mappings (host:guest, one per line)</label><textarea id="bootstrap-ports" rows="3" placeholder="3000:3000&#10;8080:80">${Array.isArray(c.ports) ? c.ports.map(p => p.host + ':' + p.guest).join('\\n') : ''}</textarea></div>
+        <div class="form-group"><label>Volume mounts (host:container, one per line)</label><textarea id="bootstrap-volumes" rows="3" placeholder="/Users/me/projects:/home/vm/projects">${Array.isArray(c.volumes) ? c.volumes.filter(v => v.host_path).map(v => v.host_path + ':' + v.mount).join('\\n') : ''}</textarea></div>`;
+    }
+
+    fields += `
+        <div class="form-group"><label>Hook scripts (one path per line)</label><textarea id="bootstrap-hook-scripts" rows="5" placeholder="/path/to/hooks.sh">${Array.isArray(c.hookScripts) ? c.hookScripts.join('\\n') : (c.hookScripts || '')}</textarea></div>
         <div class="form-group"><label>Git user name</label><input id="bootstrap-git-user" placeholder="Your Name" value="${c.userName || ''}"></div>
-        <div class="form-group"><label>Git user email</label><input id="bootstrap-git-email" placeholder="you@example.com" value="${c.userEmail || ''}"></div>
-    `, async () => {
+        <div class="form-group"><label>Git user email</label><input id="bootstrap-git-email" placeholder="you@example.com" value="${c.userEmail || ''}"></div>`;
+
+    showModal('Bootstrap Preferences', fields, async () => {
         setBusy(true); setAction('Running bootstrap...');
         try {
             const body = {
                 shell: document.getElementById('bootstrap-shell').value,
                 editor: document.getElementById('bootstrap-editor').value,
-                windowManager: document.getElementById('bootstrap-wm').value,
+                backend: document.getElementById('bootstrap-backend').value,
             };
+            const newBackend = body.backend;
+            const newIsContainer = newBackend === 'sbx' || newBackend === 'podman';
+
+            if (!newIsContainer) {
+                body.windowManager = document.getElementById('bootstrap-wm')?.value || 'xfce';
+            }
             const mem = parseInt(document.getElementById('bootstrap-memory').value);
-            const disk = document.getElementById('bootstrap-disk').value.trim();
-            const ip = document.getElementById('bootstrap-ip').value.trim();
             if (mem > 0) body.memoryMiB = mem;
-            if (disk) body.diskSize = disk;
-            if (ip) body.staticIP = ip;
+            if (!newIsContainer) {
+                const disk = document.getElementById('bootstrap-disk')?.value.trim();
+                const ip = document.getElementById('bootstrap-ip')?.value.trim();
+                if (disk) body.diskSize = disk;
+                if (ip) body.staticIP = ip;
+            }
+            if (newIsContainer) {
+                const env = document.getElementById('bootstrap-environment')?.value.trim();
+                if (env) body.environment = env;
+                const portsText = document.getElementById('bootstrap-ports')?.value.trim();
+                if (portsText) {
+                    body.ports = portsText.split('\n').map(l => l.trim()).filter(l => l).map(l => {
+                        const [h, g] = l.split(':');
+                        return { host: parseInt(h), guest: parseInt(g) };
+                    });
+                }
+                const volsText = document.getElementById('bootstrap-volumes')?.value.trim();
+                if (volsText) {
+                    body.volumes = volsText.split('\n').map(l => l.trim()).filter(l => l).map(l => {
+                        const [hp, mp] = l.split(':');
+                        return { host_path: hp, mount: mp };
+                    });
+                }
+            }
             const hookScriptsText = document.getElementById('bootstrap-hook-scripts').value.trim();
             body.hookScripts = hookScriptsText ? hookScriptsText.split('\n').map(s => s.trim()).filter(s => s) : [];
             body.userName = document.getElementById('bootstrap-git-user').value.trim();

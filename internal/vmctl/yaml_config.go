@@ -9,14 +9,19 @@ import (
 
 // VMConfigFile is the on-disk YAML schema for ~/.config/agent-vm/vmctl.yaml
 type VMConfigFile struct {
-	VM        VMConfig        `yaml:"vm"`
-	Network   NetworkConfig   `yaml:"network"`
-	User      UserConfig      `yaml:"user"`
-	Guest     GuestConfig     `yaml:"guest"`
-	Bootstrap BootstrapConfig `yaml:"bootstrap"`
-	Git       GitConfig       `yaml:"git"`
-	Sync      []SyncPair      `yaml:"sync"`
-	Tunnels   []Tunnel        `yaml:"tunnels"`
+	Backend      string          `yaml:"backend"`
+	VM           VMConfig        `yaml:"vm"`
+	Network      NetworkConfig   `yaml:"network"`
+	User         UserConfig      `yaml:"user"`
+	Guest        GuestConfig     `yaml:"guest"`
+	Bootstrap    BootstrapConfig `yaml:"bootstrap"`
+	Git          GitConfig       `yaml:"git"`
+	Environment  string          `yaml:"environment"`
+	Image        string          `yaml:"image"`
+	Sync         []SyncPair      `yaml:"sync"`
+	Tunnels      []Tunnel        `yaml:"tunnels"`
+	Volumes      []VolumeMount   `yaml:"volumes"`
+	PortMappings []PortMapping   `yaml:"ports"`
 }
 
 type VMConfig struct {
@@ -123,6 +128,9 @@ func loadVMConfigFile(path string) (VMConfigFile, error) {
 }
 
 func (c *VMConfigFile) applyDefaults() {
+	if c.Backend == "" {
+		c.Backend = "utm"
+	}
 	if c.VM.Name == "" {
 		c.VM.Name = "void-dev"
 	}
@@ -139,20 +147,22 @@ func (c *VMConfigFile) applyDefaults() {
 		t := true
 		c.VM.GUI = &t
 	}
-	if c.Network.StaticIP == "" {
-		c.Network.StaticIP = "192.168.64.10"
-	}
-	if c.Network.Gateway == "" {
-		c.Network.Gateway = "192.168.64.1"
-	}
-	if c.Network.CIDR == 0 {
-		c.Network.CIDR = 24
-	}
-	if len(c.Network.DNSServers) == 0 {
-		c.Network.DNSServers = []string{"1.1.1.1", "8.8.8.8"}
-	}
-	if c.Network.MAC == "" {
-		c.Network.MAC = "52:54:00:64:00:10"
+	if c.Backend == "utm" || c.Backend == "" {
+		if c.Network.StaticIP == "" {
+			c.Network.StaticIP = "192.168.64.10"
+		}
+		if c.Network.Gateway == "" {
+			c.Network.Gateway = "192.168.64.1"
+		}
+		if c.Network.CIDR == 0 {
+			c.Network.CIDR = 24
+		}
+		if len(c.Network.DNSServers) == 0 {
+			c.Network.DNSServers = []string{"1.1.1.1", "8.8.8.8"}
+		}
+		if c.Network.MAC == "" {
+			c.Network.MAC = "52:54:00:64:00:10"
+		}
 	}
 	if c.User.Name == "" {
 		c.User.Name = "vm"
@@ -172,8 +182,10 @@ func (c *VMConfigFile) applyDefaults() {
 	if c.Guest.DefaultEditor == "" {
 		c.Guest.DefaultEditor = "neovim"
 	}
-	if c.Guest.WindowManager == "" {
-		c.Guest.WindowManager = "sway"
+	if c.Backend == "utm" || c.Backend == "" {
+		if c.Guest.WindowManager == "" {
+			c.Guest.WindowManager = "xfce"
+		}
 	}
 }
 

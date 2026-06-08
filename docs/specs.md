@@ -1,13 +1,13 @@
 # Agent VM Spec
 
-Updated: 2026-05-05
+Updated: 2026-06-06
 
 ## 1. Goal
 
-Provide a single-command, reproducible `arm64` Linux development VM on Apple Silicon macOS using `vfkit`.
+Provide a single-command, reproducible `arm64` Linux development VM on Apple Silicon macOS using `UTM.app` + `utmctl`.
 
 - Distribution: `Void Linux aarch64 glibc`
-- Desktop: `Sway` (configurable)
+- Desktop: `xfce` or `lxqt` (X11, configurable)
 - Fixed IP: `192.168.64.10`
 - SSH target: `ssh vm@192.168.64.10`
 - Default user: `vm`
@@ -33,9 +33,10 @@ The project supports only:
 The default implementation:
 
 - download the official `ROOTFS`
-- build the disk offline on the host via vfkit (fallback: podman)
+- build the disk offline on the host via podman
 - extract `vmlinuz` and `initramfs`
-- boot with `vfkit --kernel/--initrd`
+- generate a UTM bundle (`.utm`) with `config.plist`
+- boot with `utmctl start`
 
 ### 2.2 Unsupported Paths
 
@@ -77,7 +78,7 @@ guest:
   timezone: Australia/Sydney
   default_shell: fish
   default_editor: neovim
-  window_manager: sway
+  window_manager: xfce
 
 bootstrap:
   hook_scripts:
@@ -113,12 +114,13 @@ tunnels:
 ├── scripts/
 │   └── guest-bootstrap.sh   # generated at bootstrap time
 ├── images/                  # base Void rootfs tarballs
-└── void-dev/                # runtime state
-    ├── disk.img
-    ├── vmlinuz
-    ├── initramfs.img
-    ├── bootstrap.done
-    ├── vfkit.log / serial.log / vfkit.pid
+└── void-dev.utm/            # UTM bundle
+    ├── config.plist
+    └── Data/
+        ├── disk.img
+        ├── vmlinuz
+        ├── initramfs.img
+        └── bootstrap.done
 ```
 
 ## 4. Bootstrap
@@ -134,12 +136,13 @@ Bootstrap completion is tracked by a `bootstrap.done` marker. Subsequent VM star
 The agent-vm bootstrap installs only essential infrastructure:
 - Homebrew for Linux
 - Docker with docker-compose and docker-buildx plugins
-- Selected shell (fish/zsh), editor (neovim/helix), and window manager (sway/xfce)
-- Rust toolchain (rustup + stable), fnm + Node.js, Starship prompt
+- Selected shell (fish/zsh), editor (neovim/helix), and window manager (xfce/lxqt)
+- fnm + Node.js
 - Browsers (Chromium, Zen Browser)
 - Fcitx5 Chinese input, Ghostty terminal
+- spice-vdagent for clipboard sharing via UTM/SPICE
 
-All other developer tools (zellij, zig, lazygit, gitui, opencode, cargo crates, etc.) should be installed via user-provided hook scripts.
+All other developer tools (Rust, zellij, zig, lazygit, gitui, opencode, cargo crates, etc.) should be installed via user-provided hook scripts.
 
 ### 4.3 Post-Bootstrap Hook Scripts
 
@@ -153,11 +156,12 @@ All other developer tools (zellij, zig, lazygit, gitui, opencode, cargo crates, 
 Running `go run ./cmd/agent-vm start` must automatically:
 
 1. download the official Void rootfs into `~/.config/agent-vm/images/`
-2. build a raw disk via vfkit (or podman fallback)
+2. build a raw disk via podman
 3. write users, networking, SSH, GUI, and system config offline
 4. extract `vmlinuz` and `initramfs`
-5. start the VM
-6. wait for SSH and run bootstrap once
+5. generate UTM bundle with `config.plist`
+6. start the VM via `utmctl start`
+7. wait for SSH and run bootstrap once
 
 ### 5.2 Later Boots
 
@@ -182,13 +186,15 @@ ssh vm@192.168.64.10
 
 ### 6.3 GUI Session
 
-- `tty1 autologin -> vm -> sway` (or configured WM)
+- `tty1 autologin -> vm -> X11 desktop (xfce or lxqt)`
 - Boot directly into the user desktop session without a display manager
-- `gui: false` in YAML boots headless (no display window, no keyboard/mouse/GPU)
+- `vmctl-session` wrapper launches `startxfce4` or `startlxqt` with X11 environment variables
+- `gui: false` in YAML boots headless (no display window)
+- Clipboard sharing is handled natively by UTM via SPICE + `spice-vdagent`
 
 ## 7. Networking
 
-- `vfkit` NAT
+- UTM shared networking (virtio-net-pci)
 - Guest fixed IP: `192.168.64.10/24`
 - Default gateway: `192.168.64.1`
 - Fixed IP binds to virtual NIC MAC address
@@ -223,11 +229,11 @@ The UI provides:
 
 ### 11.2 GUI And Desktop
 
-- `sway` (or `xfce`), `seatd`, `ghostty`, `wofi`, `mako`, `grim`, `slurp`, `wl-clipboard`, `xdg-desktop-portal-wlr`, `mesa`, `mesa-dri`
+- `xfce4` or `lxqt` + `openbox`, `xorg`, `mesa`, `mesa-dri`, `ghostty`, `spice-vdagent`
 
 ### 11.3 Development Environment
 
-- `fish` or `zsh`, `starship`, `neovim` or `helix`, `rustup`, Homebrew for Linux, `zellij`, `zig`, `fnm`, `opencode`, `lazygit`, `gitui`, cargo packages
+- `fish` or `zsh`, `neovim` or `helix`, Homebrew for Linux, `fnm`, `chromium`, `zen-browser`
 
 ## 12. Acceptance Criteria
 
@@ -235,7 +241,8 @@ The UI provides:
 2. The GUI automatically enters the configured desktop session
 3. The host can `ssh vm@192.168.64.10`
 4. `bootstrap.done` prevents an unexpected second bootstrap
-5. `fish/zsh`, `ghostty`, Rust, Homebrew, Helix/Neovim, Zellij, Zig, Chromium, Zen Browser, and Fcitx5 are all present
+5. `fish/zsh`, `ghostty`, Homebrew, Helix/Neovim, Chromium, Zen Browser, and Fcitx5 are all present
 6. Post-bootstrap hooks execute once and not on restart
 7. Sync pairs and tunnels persist in `vmctl.yaml`
 8. Web UI reflects config changes without server restart
+9. Clipboard works between host and guest via UTM/SPICE

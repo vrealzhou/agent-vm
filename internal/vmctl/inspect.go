@@ -18,8 +18,8 @@ type VMStatus struct {
 	DiskPath      string
 	StaticIP      string
 	SSHTarget     string
-	BootstrapDone  bool
-	KernelVersion  string
+	BootstrapDone bool
+	KernelVersion string
 }
 
 type GuestMetricsSample struct {
@@ -49,11 +49,11 @@ func InspectVM(cfg Config) (VMStatus, error) {
 		SSHTarget:     fmt.Sprintf("%s@%s", cfg.SSHUser, cfg.StaticIP),
 		BootstrapDone: fileExists(cfg.BootstrapMarker),
 	}
-	if bootAssetsExist(cfg) {
+	if fileExists(cfg.KernelPath) {
 		status.KernelVersion = filepath.Base(cfg.KernelPath)
 	}
 
-	running, err := pidIsRunning(cfg.PIDFile)
+	running, err := utmVMIsRunning(cfg.Name)
 	if err != nil {
 		return status, err
 	}
@@ -63,17 +63,11 @@ func InspectVM(cfg Config) (VMStatus, error) {
 
 	status.Running = true
 	status.State = "running"
-	if pid, err := readPID(cfg.PIDFile); err == nil {
-		status.PID = pid
-	}
-	if resp, err := currentState(cfg); err == nil && resp.State != "" {
-		status.State = resp.State
-	}
 	return status, nil
 }
 
 func Destroy(cfg Config) error {
-	running, err := pidIsRunning(cfg.PIDFile)
+	running, err := utmVMIsRunning(cfg.Name)
 	if err != nil {
 		return err
 	}
@@ -83,8 +77,8 @@ func Destroy(cfg Config) error {
 		}
 	}
 
-	for _, path := range []string{cfg.PIDFile, cfg.RestSocket} {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if fileExists(cfg.UTMBundlePath) {
+		if err := os.RemoveAll(cfg.UTMBundlePath); err != nil {
 			return err
 		}
 	}
@@ -92,6 +86,14 @@ func Destroy(cfg Config) error {
 		return err
 	}
 	return nil
+}
+
+func utmVMIsRunning(name string) (bool, error) {
+	out, err := exec.Command("utmctl", "status", name).CombinedOutput()
+	if err != nil {
+		return false, nil
+	}
+	return strings.Contains(string(out), "running"), nil
 }
 
 func SampleGuestMetrics(cfg Config) (GuestMetricsSample, error) {
@@ -114,10 +116,11 @@ func guestMetricsCommand() string {
 
 func parseGuestMetricsSample(output string) (GuestMetricsSample, error) {
 	var (
-		cpuFields         []string
-		memTotalKiB       int
-		memAvailableKiB   int
-		haveTotal, haveAv bool
+		cpuFields       []string
+		memTotalKiB     int
+		memAvailableKiB int
+		haveTotal       bool
+		haveAv          bool
 	)
 
 	for _, line := range strings.Split(output, "\n") {

@@ -3,21 +3,19 @@ package vmctl
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
 func Start(cfg Config) error {
-	if _, err := exec.LookPath("vfkit"); err != nil {
-		return fmt.Errorf("missing required command: vfkit")
+	if _, err := exec.LookPath("utmctl"); err != nil {
+		return fmt.Errorf("missing required command: utmctl (install UTM from https://mac.getutm.app)")
 	}
 
-	running, err := pidIsRunning(cfg.PIDFile)
+	running, err := utmVMIsRunning(cfg.Name)
 	if err != nil {
 		return err
 	}
@@ -26,45 +24,22 @@ func Start(cfg Config) error {
 		return Status(cfg)
 	}
 
-	buildPIDFile := filepath.Join(cfg.StateDir, "build-vfkit.pid")
-	buildRunning, err := pidIsRunning(buildPIDFile)
-	if err == nil && buildRunning {
-		return fmt.Errorf("disk build is already in progress (PID file: %s)", buildPIDFile)
-	}
-
-	voidBootstrapCandidate := isVoidLinuxRootfsTarball(cfg.BaseImage)
-
 	cfg, err = prepareDisk(cfg)
 	if err != nil {
 		return err
 	}
-	_ = os.Remove(cfg.RestSocket)
 
-	logFile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-
-	cmd := exec.Command("vfkit", vfkitArgs(cfg)...)
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	voidBootstrapCandidate := isVoidLinuxRootfsTarball(cfg.BaseImage)
 
 	logf("starting %s", cfg.Name)
-	addProgress("launching vfkit...")
-	if err := cmd.Start(); err != nil {
-		return err
+	addProgress("starting VM via UTM...")
+	if err := exec.Command("utmctl", "start", cfg.Name).Run(); err != nil {
+		return fmt.Errorf("utmctl start failed: %w", err)
 	}
-	_ = cmd.Process.Release()
 
 	addProgress("waiting for VM to reach running state...")
-	if err := waitForState(cfg, "VirtualMachineStateRunning", 90*time.Second); err != nil {
-		tail, tailErr := tailFile(cfg.LogFile, 80)
-		if tailErr == nil && tail != "" {
-			fmt.Fprint(os.Stderr, tail)
-		}
-		return fmt.Errorf("vfkit did not reach running state")
+	if err := waitForUTMRunning(cfg.Name, 90*time.Second); err != nil {
+		return fmt.Errorf("VM did not reach running state")
 	}
 
 	logf("VM started")
@@ -103,7 +78,7 @@ func Start(cfg Config) error {
 }
 
 func Stop(cfg Config) error {
-	running, err := pidIsRunning(cfg.PIDFile)
+	running, err := utmVMIsRunning(cfg.Name)
 	if err != nil {
 		return err
 	}
@@ -113,24 +88,17 @@ func Stop(cfg Config) error {
 	}
 
 	logf("stopping %s", cfg.Name)
-	if err := restStateChange(cfg, "HardStop"); err != nil {
-		pid, readErr := readPID(cfg.PIDFile)
-		if readErr == nil {
-			if proc, findErr := os.FindProcess(pid); findErr == nil {
-				_ = proc.Signal(syscall.SIGTERM)
-			}
-		}
+	if err := exec.Command("utmctl", "stop", cfg.Name).Run(); err != nil {
+		return fmt.Errorf("utmctl stop failed: %w", err)
 	}
 
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		running, err = pidIsRunning(cfg.PIDFile)
+		running, err = utmVMIsRunning(cfg.Name)
 		if err != nil {
 			return err
 		}
 		if !running {
-			_ = os.Remove(cfg.PIDFile)
-			_ = os.Remove(cfg.RestSocket)
 			logf("VM stopped")
 			if err := StopAllTunnels(cfg); err != nil {
 				logf("stop tunnels: %v", err)
@@ -144,18 +112,26 @@ func Stop(cfg Config) error {
 }
 
 func Status(cfg Config) error {
-	status, err := InspectVM(cfg)
+	backend := NewBackend(cfg)
+	status, err := backend.Status(cfg)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("name: %s\n", status.Name)
+	fmt.Printf("backend: %s\n", cfg.Backend)
 	fmt.Printf("state: %s\n", status.State)
-	fmt.Printf("disk: %s\n", status.DiskPath)
-	fmt.Printf("ip: %s\n", status.StaticIP)
+	if cfg.Backend == "" || cfg.Backend == "utm" {
+		fmt.Printf("disk: %s\n", status.DiskPath)
+		fmt.Printf("ip: %s\n", status.StaticIP)
+	}
 	fmt.Printf("bootstrap: %t\n", status.BootstrapDone)
 	if status.Running {
-		fmt.Printf("pid: %d\n", status.PID)
-		fmt.Printf("ssh: ssh %s\n", status.SSHTarget)
+		if cfg.Backend == "" || cfg.Backend == "utm" {
+			fmt.Printf("ssh: ssh %s\n", status.SSHTarget)
+		} else {
+			fmt.Printf("container: %s\n", cfg.ContainerName)
+			fmt.Printf("image: %s\n", cfg.Image)
+		}
 	}
 	return nil
 }
@@ -355,14 +331,14 @@ func prepareDisk(cfg Config) (Config, error) {
 	}
 
 	if fileExists(cfg.DiskPath) {
-		if isVoidLinuxRootfsTarball(cfg.BaseImage) && !bootAssetsExist(cfg) {
-			logf("Void boot assets missing; rebuilding VM disk")
-			addProgress("rebuilding VM disk (boot assets missing)...")
-			if err := buildVoidLinuxDisk(cfg); err != nil {
-				return cfg, err
-			}
+		if err := ensureUTMBundle(cfg); err != nil {
+			return cfg, err
 		}
 		return cfg, nil
+	}
+
+	if err := ensureUTMBundle(cfg); err != nil {
+		return cfg, err
 	}
 
 	addProgress("preparing VM disk for first boot...")
@@ -465,39 +441,6 @@ func resizeRawDisk(cfg Config) error {
 	return runCommand("qemu-img", "resize", "-f", "raw", cfg.DiskPath, cfg.DiskSize)
 }
 
-func vfkitArgs(cfg Config) []string {
-	args := []string{
-		"--cpus", fmt.Sprintf("%d", cfg.CPUs),
-		"--memory", fmt.Sprintf("%d", cfg.MemoryMiB),
-		"--device", fmt.Sprintf("virtio-blk,path=%s", cfg.DiskPath),
-		"--device", fmt.Sprintf("virtio-net,nat,mac=%s", cfg.MAC),
-		"--device", "virtio-rng",
-		"--device", "virtio-balloon",
-		"--device", fmt.Sprintf("virtio-serial,logFilePath=%s", cfg.SerialLog),
-		"--restful-uri", fmt.Sprintf("unix://%s", cfg.RestSocket),
-		"--pidfile", cfg.PIDFile,
-		"--log-level", "info",
-	}
-	if bootAssetsExist(cfg) {
-		args = append(args,
-			"--kernel", cfg.KernelPath,
-			"--initrd", cfg.InitrdPath,
-			"--kernel-cmdline", "root=/dev/vda rw console=hvc0 quiet loglevel=3",
-		)
-	} else {
-		args = append(args, "--bootloader", fmt.Sprintf("efi,variable-store=%s,create", cfg.EFIVarsPath))
-	}
-	if cfg.GUI {
-		args = append(args,
-			"--device", "virtio-input,keyboard",
-			"--device", "virtio-input,pointing",
-			"--device", fmt.Sprintf("virtio-gpu,width=%d,height=%d", cfg.Width, cfg.Height),
-			"--gui",
-		)
-	}
-	return args
-}
-
 func sshArgs(cfg Config) []string {
 	return sshArgsForUser(cfg, cfg.SSHUser)
 }
@@ -526,27 +469,17 @@ func sshArgsForUser(cfg Config, user string) []string {
 	return args
 }
 
-func bootAssetsExist(cfg Config) bool {
-	return fileExists(cfg.KernelPath) && fileExists(cfg.InitrdPath)
-}
-
 func buildVoidLinuxDisk(cfg Config) error {
 	if !fileExists(cfg.SSHPublicKey) {
 		return fmt.Errorf("VM_SSH_PUBLIC_KEY does not exist: %s", cfg.SSHPublicKey)
 	}
 
-	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cfg.DiskPath), 0o755); err != nil {
 		return err
 	}
 
-	if _, err := exec.LookPath("vfkit"); err == nil {
-		logf("building Void Linux VM disk using vfkit")
-		addProgress("building Void Linux VM disk via vfkit (this takes several minutes)...")
-		return buildVoidLinuxDiskVFKit(cfg)
-	}
-
 	if _, err := exec.LookPath("podman"); err != nil {
-		return fmt.Errorf("missing required command: vfkit or podman")
+		return fmt.Errorf("missing required command: podman (needed for Void Linux disk build)")
 	}
 	logf("building Void Linux VM disk using podman")
 	addProgress("building Void Linux VM disk (this takes several minutes)...")
@@ -568,19 +501,157 @@ func buildVoidLinuxDisk(cfg Config) error {
 		"-e", "DEFAULT_EDITOR="+cfg.DefaultEditor,
 		"-e", "WINDOW_MANAGER="+cfg.WindowManager,
 		"-v", cfg.ImageDir+":/repo:ro",
-		"-v", cfg.StateDir+":/work",
+		"-v", filepath.Dir(cfg.DiskPath)+":/work",
 		"-v", cfg.BaseImage+":/input/base.tar.xz:ro",
 		"-v", cfg.SSHPublicKey+":/input/authorized_key.pub:ro",
 		"docker.io/library/debian:stable-slim",
-		"bash", "-lc", voidLinuxBuildScript(),
+		"bash", "-lc", voidLinuxBuildScript(cfg),
 	)
 	builder.Stdout = os.Stdout
 	builder.Stderr = os.Stderr
 	return builder.Run()
 }
 
-func voidLinuxBuildScript() string {
-	return `
+func waitForUTMRunning(name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		running, err := utmVMIsRunning(name)
+		if err == nil && running {
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
+	return fmt.Errorf("timeout waiting for VM %s to start", name)
+}
+
+func fixGuestConfig(cfg Config) error {
+	pubKey, err := os.ReadFile(cfg.SSHPublicKey)
+	if err != nil {
+		return err
+	}
+	key := shellQuote(strings.TrimSpace(string(pubKey)))
+	guest := shellQuote(cfg.GuestUser)
+	script := fmt.Sprintf(`set -e
+guest=%s
+pubkey=%s
+
+mkdir -p /home/"${guest}"/.ssh /home/"${guest}"/.config/fish/conf.d
+printf '%%s\n' "${pubkey}" > /home/"${guest}"/.ssh/authorized_keys
+chmod 700 /home/"${guest}"/.ssh
+chmod 600 /home/"${guest}"/.ssh/authorized_keys
+
+cat > /home/"${guest}"/.bash_profile <<'EOF'
+export XDG_RUNTIME_DIR="${HOME}/.local/run"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
+  exec /usr/local/bin/vmctl-session
+fi
+EOF
+
+cat > /home/"${guest}"/.zprofile <<'EOF'
+export XDG_RUNTIME_DIR="${HOME}/.local/run"
+mkdir -p "${XDG_RUNTIME_DIR}"
+chmod 700 "${XDG_RUNTIME_DIR}"
+if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
+  exec /usr/local/bin/vmctl-session
+fi
+EOF
+
+cat > /home/"${guest}"/.config/fish/conf.d/vmctl-session.fish <<'EOF'
+if status is-interactive
+  if test -z "$DISPLAY"
+    if string match -q /dev/tty1 (tty 2>/dev/null)
+      exec /usr/local/bin/vmctl-session
+    end
+  end
+end
+EOF
+
+chown -R "${guest}:${guest}" /home/"${guest}" 2>/dev/null || true
+passwd -d "${guest}" >/dev/null 2>&1 || true
+usermod -U "${guest}" >/dev/null 2>&1 || true
+grep -q '^PerSourcePenalties no$' /etc/ssh/sshd_config.d/99-vmctl.conf || printf '\nPerSourcePenalties no\n' >> /etc/ssh/sshd_config.d/99-vmctl.conf
+sv restart sshd >/dev/null 2>&1 || true
+
+test -s /home/"${guest}"/.ssh/authorized_keys
+test -s /home/"${guest}"/.bash_profile
+test -s /home/"${guest}"/.config/fish/conf.d/vmctl-session.fish
+echo DONE
+`, guest, key)
+
+	cmd := exec.Command("ssh", append(sshArgsForUser(cfg, "root"), "sh -s")...)
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fixGuestConfig: %w\n%s", err, string(out))
+	}
+	if !strings.Contains(string(out), "DONE") {
+		return fmt.Errorf("fixGuestConfig incomplete:\n%s", string(out))
+	}
+	logf("guest configuration repaired")
+	return nil
+}
+
+func ensureUTMBundle(cfg Config) error {
+	if fileExists(filepath.Join(cfg.UTMBundlePath, "config.plist")) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.UTMBundlePath, "Data"), 0o755); err != nil {
+		return err
+	}
+	return writeUTMConfigPlist(cfg)
+}
+
+func writeUTMConfigPlist(cfg Config) error {
+	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>system</key>
+	<dict>
+		<key>architecture</key><string>aarch64</string>
+		<key>backend</key><string>qemu</string>
+		<key>cpuCount</key><integer>%d</integer>
+		<key>memory</key><integer>%d</integer>
+	</dict>
+	<key>display</key>
+	<dict>
+		<key>hardware</key><string>virtio-gpu-pci</string>
+	</dict>
+	<key>drives</key>
+	<array>
+		<dict>
+			<key>imageName</key><string>disk.img</string>
+			<key>interface</key><string>virtio</string>
+			<key>size</key><integer>%d</integer>
+		</dict>
+	</array>
+	<key>network</key>
+	<array>
+		<dict>
+			<key>hardware</key><string>virtio-net-pci</string>
+			<key>mode</key><string>shared</string>
+		</dict>
+	</array>
+	<key>input</key>
+	<dict>
+		<key>keyboard</key><true/>
+		<key>pointer</key><true/>
+	</dict>
+	<key>sharing</key>
+	<dict>
+		<key>clipboardSharing</key><true/>
+	</dict>
+</dict>
+</plist>
+`, cfg.CPUs, cfg.MemoryMiB, 0)
+
+	return os.WriteFile(filepath.Join(cfg.UTMBundlePath, "config.plist"), []byte(plist), 0o644)
+}
+
+func voidLinuxBuildScript(cfg Config) string {
+	return `#!/bin/bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -634,8 +705,8 @@ repository=${repo}
 EOF
 
 retry_chroot_xbps "xbps-install -R ${repo} -Sy xbps && xbps-install -R ${repo} -uy xbps"
-retry_chroot_xbps "DRACUT_NO_XATTR=1 xbps-install -R ${repo} -Suy linux6.12 dracut openssh NetworkManager dbus fish-shell zsh curl wget git unzip bash file sudo chrony neovim"
-retry_chroot_xbps "xbps-install -R ${repo} -Suy seatd sway foot ghostty ghostty-terminfo mesa mesa-dri wl-clipboard wofi mako grim slurp xdg-desktop-portal-wlr xorg xfce4 xfce4-terminal fcitx5 fcitx5-chinese-addons fcitx5-configtool fcitx5-gtk+2 fcitx5-gtk+3 fcitx5-gtk4 fcitx5-qt5 fcitx5-qt6 noto-fonts-cjk noto-fonts-emoji"
+retry_chroot_xbps "DRACUT_NO_XATTR=1 xbps-install -R ${repo} -Suy linux6.12 dracut openssh NetworkManager dbus fish-shell zsh curl wget git unzip bash file sudo chrony neovim helix docker make"
+retry_chroot_xbps "xbps-install -R ${repo} -Suy xorg xfce4 xfce4-terminal lxqt openbox ghostty ghostty-terminfo mesa mesa-dri fcitx5 fcitx5-chinese-addons fcitx5-configtool fcitx5-gtk+2 fcitx5-gtk+3 fcitx5-gtk4 fcitx5-qt5 fcitx5-qt6 noto-fonts-cjk noto-fonts-emoji font-sarasa-gothic spice-vdagent"
 retry_chroot_xbps "xbps-install -R ${repo} -Suy chromium"
 
 printf '%s\n' "${VM_NAME}" >/tmp/void-rootfs/etc/hostname
@@ -645,6 +716,7 @@ cat >/tmp/void-rootfs/etc/ssh/sshd_config.d/99-vmctl.conf <<SSH
 PermitRootLogin prohibit-password
 PasswordAuthentication no
 KbdInteractiveAuthentication no
+PerSourcePenalties no
 SSH
 
 guest_shell="/bin/bash"
@@ -654,9 +726,9 @@ case "${DEFAULT_SHELL}" in
 esac
 
 if ! chroot /tmp/void-rootfs /usr/bin/id -u "${GUEST_USER}" >/dev/null 2>&1; then
-  chroot /tmp/void-rootfs /usr/sbin/useradd -m -G wheel,audio,video,input,_seatd -s "${guest_shell}" "${GUEST_USER}"
+  chroot /tmp/void-rootfs /usr/sbin/useradd -m -G wheel,audio,video,input,docker -s "${guest_shell}" "${GUEST_USER}"
 else
-  chroot /tmp/void-rootfs /usr/sbin/usermod -aG wheel,audio,video,input,_seatd "${GUEST_USER}"
+  chroot /tmp/void-rootfs /usr/sbin/usermod -aG wheel,audio,video,input,docker "${GUEST_USER}"
   chroot /tmp/void-rootfs /usr/sbin/usermod -s "${guest_shell}" "${GUEST_USER}"
 fi
 
@@ -748,38 +820,13 @@ case "${WINDOW_MANAGER}" in
     exec startxfce4
     ;;
   *)
-    export XDG_CURRENT_DESKTOP=sway
-    export XDG_SESSION_TYPE=wayland
-    export WLR_RENDERER=pixman
-    export WLR_NO_HARDWARE_CURSORS=1
+    export XDG_CURRENT_DESKTOP=LXQt
+    export XDG_SESSION_DESKTOP=lxqt
+    export XDG_SESSION_TYPE=x11
     if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-      exec dbus-run-session sh -lc '
-        sway &
-        sway_pid=$!
-        for _ in $(seq 1 100); do
-          sock=$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name "wayland-*" | head -n 1)
-          if [ -n "${sock}" ]; then
-            export WAYLAND_DISPLAY=$(basename "${sock}")
-            break
-          fi
-          sleep 0.1
-        done
-        fcitx5 -d -r >/tmp/fcitx5.log 2>&1 || true
-        wait "${sway_pid}"
-      '
+      exec dbus-run-session startlxqt
     fi
-    sway &
-    sway_pid=$!
-    for _ in $(seq 1 100); do
-      sock=$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name "wayland-*" | head -n 1)
-      if [ -n "${sock}" ]; then
-        export WAYLAND_DISPLAY=$(basename "${sock}")
-        break
-      fi
-      sleep 0.1
-    done
-    fcitx5 -d -r >/tmp/fcitx5.log 2>&1 || true
-    wait "${sway_pid}"
+    exec startlxqt
     ;;
 esac
 EOF
@@ -793,28 +840,26 @@ exec /usr/bin/chromium --ozone-platform=x11 "$@"
 EOF
 chmod 0755 /tmp/void-rootfs/usr/local/bin/vmctl-chromium
 
-cat >/tmp/void-rootfs/usr/local/bin/vmctl-swaybar-status <<'EOF'
-#!/bin/sh
-printf '{"version":1}\n[\n[]\n'
-while :; do
-  im_name="$(fcitx5-remote -n 2>/dev/null || true)"
-  case "${im_name}" in
-    pinyin) im_label="中" ;;
-    keyboard-us|"") im_label="EN" ;;
-    *) im_label="${im_name}" ;;
-  esac
-  time_text="$(date '+%Y-%m-%d %H:%M:%S')"
-  printf ',[{"name":"input","full_text":"IM: %s"},{"name":"time","full_text":"%s"}]\n' "${im_label}" "${time_text}"
-  sleep 1
+mkdir -p /tmp/void-rootfs/etc/runit/runsvdir/default
+for svc in dbus sshd NetworkManager chronyd docker spice-vdagentd; do
+  if [ -d "/tmp/void-rootfs/etc/sv/${svc}" ]; then
+    ln -snf "/etc/sv/${svc}" "/tmp/void-rootfs/etc/runit/runsvdir/default/${svc}"
+  fi
 done
+cat >/tmp/void-rootfs/etc/sv/agetty-tty1/conf <<EOF
+if [ -x /sbin/agetty -o -x /bin/agetty ]; then
+	GETTY_ARGS="--autologin ${GUEST_USER} --noclear"
+fi
+
+BAUD_RATE=38400
+TERM_NAME=linux
 EOF
-chmod 0755 /tmp/void-rootfs/usr/local/bin/vmctl-swaybar-status
 
 cat >/tmp/void-rootfs/home/"${GUEST_USER}"/.bash_profile <<'EOF'
 export XDG_RUNTIME_DIR="${HOME}/.local/run"
 mkdir -p "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
+if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
   exec /usr/local/bin/vmctl-session
 fi
 EOF
@@ -823,9 +868,8 @@ chroot /tmp/void-rootfs /usr/bin/chown "${GUEST_USER}:${GUEST_USER}" /home/"${GU
 mkdir -p /tmp/void-rootfs/home/"${GUEST_USER}"/.config/fish/conf.d
 cat >/tmp/void-rootfs/home/"${GUEST_USER}"/.config/fish/conf.d/vmctl-session.fish <<'EOF'
 if status is-interactive
-  if test -z "$WAYLAND_DISPLAY"; and test -z "$DISPLAY"
-    set current_tty (tty 2>/dev/null)
-    if test "$current_tty" = "/dev/tty1"
+  if test -z "$DISPLAY"
+    if string match -q /dev/tty1 (tty 2>/dev/null)
       exec /usr/local/bin/vmctl-session
     end
   end
@@ -835,7 +879,7 @@ cat >/tmp/void-rootfs/home/"${GUEST_USER}"/.zprofile <<'EOF'
 export XDG_RUNTIME_DIR="${HOME}/.local/run"
 mkdir -p "${XDG_RUNTIME_DIR}"
 chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
+if [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
   exec /usr/local/bin/vmctl-session
 fi
 EOF
@@ -934,44 +978,6 @@ Exec=/usr/local/bin/vmctl-chromium --incognito
 EOF
 chroot /tmp/void-rootfs /usr/bin/chown -R "${GUEST_USER}:${GUEST_USER}" /home/"${GUEST_USER}"/.local/share/applications
 
-mkdir -p /tmp/void-rootfs/etc/runit/runsvdir/default
-for svc in dbus sshd NetworkManager seatd chronyd; do
-  if [ -d "/tmp/void-rootfs/etc/sv/${svc}" ]; then
-    ln -snf "/etc/sv/${svc}" "/tmp/void-rootfs/etc/runit/runsvdir/default/${svc}"
-  fi
-done
-cat >/tmp/void-rootfs/etc/sv/agetty-tty1/conf <<EOF
-if [ -x /sbin/agetty -o -x /bin/agetty ]; then
-	GETTY_ARGS="--autologin ${GUEST_USER} --noclear"
-fi
-
-BAUD_RATE=38400
-TERM_NAME=linux
-EOF
-
-mkdir -p /tmp/void-rootfs/etc/sway/config.d
-cat >/tmp/void-rootfs/etc/sway/config.d/10-vmctl.conf <<'EOF'
-set $term ghostty
-unbindsym $mod+Return
-bindsym $mod+Return exec $term
-set $menu wofi --show drun
-unbindsym $mod+d
-bindsym $mod+d exec $menu
-input type:pointer {
-    natural_scroll enabled
-}
-input type:touchpad {
-    natural_scroll enabled
-}
-EOF
-
-cat >/tmp/void-rootfs/etc/sway/config.d/20-vmctl-bar.conf <<'EOF'
-bar bar-0 {
-    tray_output *
-    status_command /usr/local/bin/vmctl-swaybar-status
-}
-EOF
-
 chroot /tmp/void-rootfs /bin/sh -lc "DRACUT_NO_XATTR=1 xbps-reconfigure -fa || true"
 
 kernel="$(
@@ -991,141 +997,4 @@ cp "${initrd}" /work/initramfs.img
 truncate -s "${DISK_SIZE}" /work/disk.img
 mkfs.ext4 -F -L rootfs -d /tmp/void-rootfs /work/disk.img
 `
-}
-
-func ClipboardIn(cfg Config) error {
-	if _, err := exec.LookPath("pbpaste"); err != nil {
-		return fmt.Errorf("missing required command: pbpaste")
-	}
-	ssh := exec.Command("ssh", append(sshArgsForUser(cfg, cfg.GuestUser), waylandClipboardShell("wl-copy"))...)
-	pbpaste := exec.Command("pbpaste")
-
-	reader, writer := io.Pipe()
-	pbpaste.Stdout = writer
-	ssh.Stdin = reader
-	ssh.Stdout = os.Stdout
-	ssh.Stderr = os.Stderr
-	pbpaste.Stderr = os.Stderr
-
-	if err := ssh.Start(); err != nil {
-		return err
-	}
-	if err := pbpaste.Start(); err != nil {
-		_ = ssh.Process.Kill()
-		return err
-	}
-
-	pbErr := pbpaste.Wait()
-	_ = writer.Close()
-	sshErr := ssh.Wait()
-	_ = reader.Close()
-	if pbErr != nil {
-		return pbErr
-	}
-	return sshErr
-}
-
-func ClipboardOut(cfg Config) error {
-	if _, err := exec.LookPath("pbcopy"); err != nil {
-		return fmt.Errorf("missing required command: pbcopy")
-	}
-	ssh := exec.Command("ssh", append(sshArgsForUser(cfg, cfg.GuestUser), waylandClipboardShell("wl-paste --no-newline"))...)
-	pbcopy := exec.Command("pbcopy")
-
-	reader, writer := io.Pipe()
-	ssh.Stdout = writer
-	ssh.Stderr = os.Stderr
-	pbcopy.Stdin = reader
-	pbcopy.Stdout = os.Stdout
-	pbcopy.Stderr = os.Stderr
-
-	if err := pbcopy.Start(); err != nil {
-		return err
-	}
-	if err := ssh.Start(); err != nil {
-		_ = pbcopy.Process.Kill()
-		return err
-	}
-
-	sshErr := ssh.Wait()
-	_ = writer.Close()
-	pbErr := pbcopy.Wait()
-	_ = reader.Close()
-	if sshErr != nil {
-		return sshErr
-	}
-	return pbErr
-}
-
-func waylandClipboardShell(command string) string {
-	return "sh -lc " + shellQuote(`uid="$(id -u)"; runtime_dir="${HOME}/.local/run"; [ -d "${runtime_dir}" ] || runtime_dir="/run/user/${uid}"; export XDG_RUNTIME_DIR="${runtime_dir}"; sock="$(find "${XDG_RUNTIME_DIR}" -maxdepth 1 -type s -name 'wayland-*' | head -n 1)"; [ -n "${sock}" ] || { echo "no Wayland socket found; log into Sway first" >&2; exit 1; }; export WAYLAND_DISPLAY="$(basename "${sock}")"; `+command)
-}
-
-func fixGuestConfig(cfg Config) error {
-	pubKey, err := os.ReadFile(cfg.SSHPublicKey)
-	if err != nil {
-		return err
-	}
-	key := shellQuote(strings.TrimSpace(string(pubKey)))
-	guest := shellQuote(cfg.GuestUser)
-	script := fmt.Sprintf(`set -e
-guest=%s
-pubkey=%s
-
-mkdir -p /home/"${guest}"/.ssh /home/"${guest}"/.config/fish/conf.d
-printf '%%s\n' "${pubkey}" > /home/"${guest}"/.ssh/authorized_keys
-chmod 700 /home/"${guest}"/.ssh
-chmod 600 /home/"${guest}"/.ssh/authorized_keys
-
-cat > /home/"${guest}"/.bash_profile <<'EOF'
-export XDG_RUNTIME_DIR="${HOME}/.local/run"
-mkdir -p "${XDG_RUNTIME_DIR}"
-chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
-  exec /usr/local/bin/vmctl-session
-fi
-EOF
-
-cat > /home/"${guest}"/.zprofile <<'EOF'
-export XDG_RUNTIME_DIR="${HOME}/.local/run"
-mkdir -p "${XDG_RUNTIME_DIR}"
-chmod 700 "${XDG_RUNTIME_DIR}"
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ] && [ "$(tty 2>/dev/null)" = "/dev/tty1" ]; then
-  exec /usr/local/bin/vmctl-session
-fi
-EOF
-
-cat > /home/"${guest}"/.config/fish/conf.d/vmctl-session.fish <<'EOF'
-if status is-interactive
-  if test -z "$WAYLAND_DISPLAY"; and test -z "$DISPLAY"
-    if string match -q /dev/tty1 (tty 2>/dev/null)
-      exec /usr/local/bin/vmctl-session
-    end
-  end
-end
-EOF
-
-chown -R "${guest}:${guest}" /home/"${guest}" 2>/dev/null || true
-passwd -d "${guest}" >/dev/null 2>&1 || true
-usermod -U "${guest}" >/dev/null 2>&1 || true
-grep -q '^PerSourcePenalties no$' /etc/ssh/sshd_config.d/99-vmctl.conf || printf '\nPerSourcePenalties no\n' >> /etc/ssh/sshd_config.d/99-vmctl.conf
-sv restart sshd >/dev/null 2>&1 || true
-
-test -s /home/"${guest}"/.ssh/authorized_keys
-test -s /home/"${guest}"/.bash_profile
-test -s /home/"${guest}"/.config/fish/conf.d/vmctl-session.fish
-echo DONE
-`, guest, key)
-
-	cmd := exec.Command("ssh", append(sshArgsForUser(cfg, "root"), "sh -s")...)
-	cmd.Stdin = strings.NewReader(script)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("fixGuestConfig: %w\n%s", err, string(out))
-	}
-	if !strings.Contains(string(out), "DONE") {
-		return fmt.Errorf("fixGuestConfig incomplete:\n%s", string(out))
-	}
-	logf("guest configuration repaired")
-	return nil
 }

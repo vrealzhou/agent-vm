@@ -1,14 +1,11 @@
 package vmctl
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,10 +16,6 @@ import (
 	"syscall"
 	"time"
 )
-
-type vmStateResponse struct {
-	State string `json:"state"`
-}
 
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
@@ -383,19 +376,6 @@ func parseSize(v string) (int64, error) {
 	return n * multiplier, nil
 }
 
-func createSparseFile(path, size string) error {
-	bytesSize, err := parseSize(size)
-	if err != nil {
-		return err
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return file.Truncate(bytesSize)
-}
-
 func downloadHTTPClient(timeout time.Duration) *http.Client {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -409,97 +389,8 @@ func downloadHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Transport: transport, Timeout: timeout}
 }
 
-func unixHTTPClient(socketPath string) *http.Client {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "unix", socketPath)
-		},
-	}
-	return &http.Client{Transport: transport, Timeout: 5 * time.Second}
-}
-
-func currentState(cfg Config) (vmStateResponse, error) {
-	client := unixHTTPClient(cfg.RestSocket)
-	resp, err := client.Get("http://localhost/vm/state")
-	if err != nil {
-		return vmStateResponse{}, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return vmStateResponse{}, fmt.Errorf("unexpected status querying vm state: %s %s", resp.Status, strings.TrimSpace(string(body)))
-	}
-
-	var state vmStateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
-		return vmStateResponse{}, err
-	}
-	return state, nil
-}
-
-func waitForState(cfg Config, expected string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		resp, err := currentState(cfg)
-		if err == nil {
-			if resp.State == expected {
-				return nil
-			}
-			if resp.State == "VirtualMachineStateError" {
-				return errors.New("vm entered error state")
-			}
-		}
-		time.Sleep(time.Second)
-	}
-	return errors.New("timeout")
-}
-
-func restStateChange(cfg Config, desired string) error {
-	body, err := json.Marshal(map[string]string{"state": desired})
-	if err != nil {
-		return err
-	}
-	client := unixHTTPClient(cfg.RestSocket)
-	req, err := http.NewRequest(http.MethodPost, "http://localhost/vm/state", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("state change failed: %s %s", resp.Status, strings.TrimSpace(string(respBody)))
-	}
-	return nil
-}
-
-func tailFile(path string, lines int) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", err
-	}
-	all := strings.Split(string(data), "\n")
-	if len(all) > lines {
-		all = all[len(all)-lines:]
-	}
-	return strings.Join(all, "\n"), nil
-}
-
 func shellQuote(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", `'"'"'`) + "'"
-}
-
-func boolString(v bool) string {
-	if v {
-		return "1"
-	}
-	return "0"
 }
 
 func writeBootstrapMarker(cfg Config) error {

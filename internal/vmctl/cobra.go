@@ -3,6 +3,7 @@ package vmctl
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
 	"github.com/spf13/cobra"
 )
@@ -40,12 +41,11 @@ func NewRootCommand() (*cobra.Command, error) {
 		newStatusCommand(cfg),
 		newGUICommand(cfg),
 		newBootstrapCommand(cfg),
-		newClipInCommand(cfg),
-		newClipOutCommand(cfg),
 		newSSHCommand(cfg),
 		newIPCommand(cfg),
 		newSyncCommand(cfg),
 		newTunnelCommand(cfg),
+		newBuildImageCommand(cfg),
 	)
 
 	return rootCmd, nil
@@ -54,10 +54,10 @@ func NewRootCommand() (*cobra.Command, error) {
 func newStartCommand(cfg Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
-		Short: "Create missing assets and start the VM",
-		Args: leafArgs,
+		Short: "Create missing assets and start the VM or container",
+		Args:  leafArgs,
 		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
-			return Start(cfg)
+			return NewBackend(cfg).Start(cfg)
 		}),
 	}
 }
@@ -65,10 +65,10 @@ func newStartCommand(cfg Config) *cobra.Command {
 func newStopCommand(cfg Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
-		Short: "Stop the VM via vfkit REST API",
-		Args: leafArgs,
+		Short: "Stop the VM or container",
+		Args:  leafArgs,
 		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
-			return Stop(cfg)
+			return NewBackend(cfg).Stop(cfg)
 		}),
 	}
 }
@@ -76,10 +76,10 @@ func newStopCommand(cfg Config) *cobra.Command {
 func newDestroyCommand(cfg Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "destroy",
-		Short: "Stop the VM and remove generated VM state and disk files",
-		Args: leafArgs,
+		Short: "Stop and remove the VM or container and its state",
+		Args:  leafArgs,
 		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
-			return Destroy(cfg)
+			return NewBackend(cfg).Destroy(cfg)
 		}),
 	}
 }
@@ -87,8 +87,8 @@ func newDestroyCommand(cfg Config) *cobra.Command {
 func newStatusCommand(cfg Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show VM state and effective network target",
-		Args: leafArgs,
+		Short: "Show VM or container state",
+		Args:  leafArgs,
 		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
 			return Status(cfg)
 		}),
@@ -99,7 +99,7 @@ func newGUICommand(cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "gui",
 		Short: "Open the Web VM control panel",
-		Args: leafArgs,
+		Args:  leafArgs,
 		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
 			return LaunchWebServer("")
 		}),
@@ -132,28 +132,6 @@ func newBootstrapCommand(cfg Config) *cobra.Command {
 	return cmd
 }
 
-func newClipInCommand(cfg Config) *cobra.Command {
-	return &cobra.Command{
-		Use:   "clip-in",
-		Short: "Copy the macOS clipboard into the guest Wayland clipboard",
-		Args: leafArgs,
-		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
-			return ClipboardIn(cfg)
-		}),
-	}
-}
-
-func newClipOutCommand(cfg Config) *cobra.Command {
-	return &cobra.Command{
-		Use:   "clip-out",
-		Short: "Copy the guest Wayland clipboard into the macOS clipboard",
-		Args: leafArgs,
-		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
-			return ClipboardOut(cfg)
-		}),
-	}
-}
-
 func newSSHCommand(cfg Config) *cobra.Command {
 	return &cobra.Command{
 		Use:                "ssh [ssh args...]",
@@ -178,7 +156,7 @@ func newIPCommand(cfg Config) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ip",
 		Short: "Print or set the guest IP address",
-		Args: leafArgs,
+		Args:  leafArgs,
 		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
 			if setIP != "" {
 				cfg.StaticIP = setIP
@@ -194,6 +172,84 @@ func newIPCommand(cfg Config) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&setIP, "set", "", "set guest IP address in vmctl.yaml")
 	return cmd
+}
+
+func newBuildImageCommand(cfg Config) *cobra.Command {
+	var profileName string
+	var profileFile string
+	var buildAll bool
+	cmd := &cobra.Command{
+		Use:   "build-image",
+		Short: "Build a container image from an environment profile",
+		Args:  leafArgs,
+		RunE: leafRunE(func(cmd *cobra.Command, args []string) error {
+			if buildAll {
+				profiles, err := ListProfiles(cfg.ConfigDir)
+				if err != nil {
+					return fmt.Errorf("failed to list profiles: %w", err)
+				}
+				for _, p := range profiles {
+					if err := buildProfileImage(cfg, p); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+			if profileFile != "" {
+				p, err := LoadProfile(profileFile)
+				if err != nil {
+					return err
+				}
+				return buildProfileImage(cfg, p)
+			}
+			if profileName != "" {
+				p, err := ResolveProfile(cfg.ConfigDir, profileName)
+				if err != nil {
+					return err
+				}
+				return buildProfileImage(cfg, p)
+			}
+			if cfg.Environment != "" {
+				p, err := ResolveProfile(cfg.ConfigDir, cfg.Environment)
+				if err != nil {
+					return err
+				}
+				return buildProfileImage(cfg, p)
+			}
+			return fmt.Errorf("specify --profile <name>, --file <path>, or --all")
+		}),
+	}
+	cmd.Flags().StringVar(&profileName, "profile", "", "environment profile name")
+	cmd.Flags().StringVar(&profileFile, "file", "", "path to a profile YAML file")
+	cmd.Flags().BoolVar(&buildAll, "all", false, "build all profiles")
+	return cmd
+}
+
+func buildProfileImage(cfg Config, profile EnvironmentProfile) error {
+	imageName := ProfileImageName(profile)
+	logf("building image %s from profile %s", imageName, profile.Name)
+	addProgress("generating Dockerfile for %s...", profile.Name)
+	if err := WriteBuildContext(cfg, profile); err != nil {
+		return fmt.Errorf("failed to write build context: %w", err)
+	}
+
+	cli := "podman"
+	if _, err := exec.LookPath("podman"); err != nil {
+		if _, err := exec.LookPath("docker"); err != nil {
+			return fmt.Errorf("neither podman nor docker found")
+		}
+		cli = "docker"
+	}
+
+	addProgress("building image %s (this may take several minutes)...", imageName)
+	cmd := exec.Command(cli, "build", "-t", imageName, cfg.StateDir)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("image build failed: %w", err)
+	}
+	addProgress("image %s built successfully", imageName)
+	return nil
 }
 
 func leafRunE(fn func(cmd *cobra.Command, args []string) error) func(cmd *cobra.Command, args []string) error {
