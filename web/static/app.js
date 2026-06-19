@@ -266,36 +266,39 @@ els.btnBootstrap.onclick = () => {
             body.userName = document.getElementById('bootstrap-git-user').value.trim();
             body.userEmail = document.getElementById('bootstrap-git-email').value.trim();
             await API.post('/api/bootstrap', body);
-            showToast('Bootstrap started');
+            showToast('Bootstrap started — see progress log below');
         } catch (err) {
             showToast('Bootstrap failed: ' + err.message, 'error');
             setAction('Bootstrap failed: ' + err.message);
         }
         setBusy(false);
+        els.progress.classList.remove('hidden');
     });
 };
 
 els.btnStart.onclick = async () => {
-    setBusy(true); setAction('Starting VM...');
-    try { await API.post('/api/start'); showToast('VM start initiated'); }
+    setBusy(true); setAction('Starting...');
+    try { await API.post('/api/start'); showToast('Start initiated'); }
     catch (err) { showToast('Start failed: ' + err.message, 'error'); setAction('Start failed: ' + err.message); }
     setBusy(false);
+    els.progress.classList.remove('hidden');
 };
 
 els.btnStop.onclick = async () => {
-    setBusy(true); setAction('Stopping VM...');
-    try { await API.post('/api/stop'); showToast('VM stop initiated'); }
+    setBusy(true); setAction('Stopping...');
+    try { await API.post('/api/stop'); showToast('Stop initiated'); }
     catch (err) { showToast('Stop failed: ' + err.message, 'error'); setAction('Stop failed: ' + err.message); }
     setBusy(false);
+    els.progress.classList.remove('hidden');
 };
 
 els.btnDestroy.onclick = () => {
-    if (!confirm('Stop the VM and delete generated files?')) return;
-    setBusy(true); setAction('Destroying VM...');
+    if (!confirm('Stop and delete all generated files?')) return;
+    setBusy(true); setAction('Destroying...');
     API.post('/api/destroy')
         .then(() => showToast('Destroy initiated'))
         .catch(err => { showToast('Destroy failed: ' + err.message, 'error'); setAction('Destroy failed: ' + err.message); })
-        .finally(() => setBusy(false));
+        .finally(() => { setBusy(false); els.progress.classList.remove('hidden'); });
 };
 
 async function loadTunnels() {

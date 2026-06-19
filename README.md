@@ -2,201 +2,173 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A single-command, reproducible `arm64` Void Linux development VM on Apple Silicon macOS — managed entirely from a web UI.
+A single-command, reproducible development environment using Apple's native Container framework on macOS 26+.
 
-- Distribution: `Void Linux aarch64 glibc`
-- Desktop: configurable, default `Sway`
-- Network: fixed IP `192.168.64.10`, gateway `192.168.64.1`
-- Default user: `vm`
-- Resources: `6 CPU / 6 GiB RAM / 100 GiB disk`
+- Base image: `Ubuntu 22.04` (arm64)
+- Runtime: Apple Container with `--virtualization` (lightweight VM per container)
+- Default user: `vm` (passwordless sudo), shell: `zsh`
+- Resources: 6 CPU / 6 GiB RAM
+- Pre-installed: Go, Node.js (fnm), pnpm, Playwright + Chromium, Rust, uv, opencode, Homebrew, ttyd, Podman (rootless)
 
 ## Host Requirements
 
-**Platform:** Apple Silicon macOS only. `vfkit` uses Apple's Virtualization framework.
+**Platform:** macOS 26+ with Apple Container CLI.
 
 ```bash
-vfkit
-qemu-img
-curl
-ssh
-go
-```
-
-Optional fallback disk builder: `podman`.
-
-_Windows/Linux support would require replacing vfkit with QEMU. The disk image, kernel, and initrd are platform-agnostic — only the hypervisor layer needs changing._
-
-Quick check:
-
-```bash
-command -v vfkit qemu-img curl ssh go
+command -v container
 ```
 
 ## Install
 
 ```bash
-go install github.com/vrealzhou/agent-vm/cmd/agent-vm@latest
+go install github.com/vrealzhou/agent-vm@latest
 ```
+
+## Quick Start
+
+```bash
+agent-vm build                    # build the kata-dev image
+agent-vm start -w ~/projects      # start container + attach
+agent-vm web                      # open http://localhost:8080
+```
+
+If the container is already running, `start` skips creation and attaches directly — dropping you into the VM directory that matches your current host folder.
 
 ## Usage
 
-The web UI is the primary interface — everything from first boot to daily management:
+### Build the image
 
 ```bash
-agent-vm             # open http://localhost:8080
-agent-vm -p 9090     # custom port
+agent-vm build                  # uses Dockerfile's default Go version
+agent-vm build -g 1.24.0        # specify a Go version
 ```
 
-The web UI is embedded in the binary. From it you can:
-
-- **Bootstrap**: configure shell, editor, window manager, and hook scripts
-- **VM control**: start, stop, destroy with live progress streaming and guest resource metrics
-- **Sync**: set up file sync pairs (rsync or git) between host and VM
-- **Tunnels**: manage SSH port forwarding
-
-After bootstrap completes, the VM boots into the configured desktop session. Connect via SSH:
+### Start / Attach
 
 ```bash
-ssh vm@192.168.64.10
+agent-vm start                  # start (or attach to) the default container "dev"
+agent-vm start -w ~/projects    # start with a specific workspace mount
+agent-vm start myapp            # start a named container
+agent-vm start -d               # start without attaching (detached)
+agent-vm start -c 8             # allocate 8 CPUs
 ```
 
-## Configuration
+When you run `start` inside a subfolder of the workspace, the container shell opens at the corresponding subfolder under `/home/vm/workspace`:
 
-All config lives in `~/.config/agent-vm/vmctl.yaml`. Override the directory with `VMCTL_CONFIG_DIR`. Every key is optional — defaults apply for anything omitted.
-
-```yaml
-vm:
-  name: void-dev
-  cpus: 6
-  memory_mib: 6144
-  disk_size: "100G"
-  gui: true
-  width: 1920
-  height: 1200
-
-network:
-  static_ip: "192.168.64.10"
-  gateway: "192.168.64.1"
-  cidr: 24
-  dns_servers: ["1.1.1.1", "8.8.8.8"]
-  mac: "52:54:00:64:00:10"
-
-user:
-  name: vm
-  password: dev
-  root_password: root
-  ssh_public_key: ""          # blank = auto-detect ~/.ssh/id_ed25519.pub
-
-guest:
-  timezone: Australia/Sydney
-  default_shell: fish
-  default_editor: neovim
-  window_manager: sway
-
-bootstrap:
-  hook_scripts:
-    - /Users/me/.config/agent-vm/hooks/install-rust.sh
-    - /Users/me/.config/agent-vm/hooks/install-packages.sh
-
-git:
-  user_name: ""
-  user_email: ""
-
-sync:
-  - name: myproject
-    host_path: /Users/me/projects/myproject
-    target_path: /home/vm/myproject
-    mode: copy
-    direction: host-to-vm
-
-tunnels:
-  - name: webapp
-    type: local
-    local_port: 3000
-    remote_port: 3000
+```
+host:       ~/projects/myapp/src
+container:  /home/vm/workspace/myapp/src
 ```
 
-## CLI Commands
+### Stop / Restart / Destroy
 
 ```bash
-agent-vm start       # create assets + boot VM
-agent-vm stop        # stop the VM
-agent-vm destroy     # stop + remove VM state
-agent-vm status      # VM state, PID, IP, disk path
-agent-vm ssh         # SSH into guest as user "vm"
-agent-vm ip          # print or set guest IP
-agent-vm bootstrap   # run bootstrap flow (--hook script.sh, repeatable)
-agent-vm sync        # manage sync pairs
-agent-vm tunnel      # manage SSH tunnels
-agent-vm help        # show all commands
+agent-vm stop                   # stop the default container
+agent-vm restart                # stop + start + attach
+agent-vm destroy                # remove the container and its state
 ```
 
-## Networking
+All commands accept an optional `[name]` argument or `-n` flag to target a specific container.
 
-The VM runs behind vfkit NAT. Fixed IP `192.168.64.10/24`, gateway `192.168.64.1`. The host is reachable from inside the guest as `host.vm` — resolves to the gateway IP:
+### List containers
 
 ```bash
-curl http://host.vm:8080/api/status
+agent-vm list                   # alias: status, ls
 ```
 
-## Guest Bootstrap
+Only shows containers started via `agent-vm`. Containers created directly with the `container` CLI are not included.
 
-Bootstrap configures inside the VM automatically on first boot:
-
-- `fish` or `zsh` shell, `Neovim` or `Helix`, `sway` or `xfce` WM
-- `fnm` for Node.js, `Homebrew for Linux`
-- `Docker` with `docker-compose` and `docker-buildx` plugins
-- `Ghostty` terminal, `Chromium`, `Zen Browser`
-- `Fcitx5` Chinese input
-- `~/.gitconfig`, autologin to desktop session
-
-Additional tools (Rust, Starship, fonts, packages) are installed via **hook scripts** — `.sh` files you write and reference in config or pass via CLI.
-
-Config:
-```yaml
-bootstrap:
-  hook_scripts:
-    - ~/.config/agent-vm/hooks/install-rust.sh
-    - ~/.config/agent-vm/hooks/install-packages.sh
-```
-
-CLI (repeatable):
-```bash
-agent-vm bootstrap --hook install-rust.sh --hook install-packages.sh
-```
-
-## Rebuild
+### Web Portal
 
 ```bash
-rm -rf ~/.config/agent-vm/void-dev
-agent-vm start
+agent-vm web                    # portal on http://localhost:8080
+agent-vm web -p 9090            # custom port
 ```
 
-## Troubleshooting
+The portal provides browser-based access to every container through a single host port — **no host port publishing needed**. Each running container shows two buttons:
 
-- Log: `~/.config/agent-vm/void-dev/vfkit.log`
-- Serial: `~/.config/agent-vm/void-dev/serial.log`
-- Build log: `~/.config/agent-vm/void-dev/build-script.log`
+- **OpenCode** — opens the OpenCode web interface (AI coding agent)
+- **Terminal** — opens a full web terminal (ttyd + xterm.js) with mobile keyboard support
 
-### VPN breaks SSH to VM
+**Access URLs** (subdomain-based routing via `*.localhost`):
 
-Cisco AnyConnect and similar VPNs redirect all traffic including local subnets:
+| URL | Service | Internal port |
+|---|---|---|
+| `http://<name>.localhost:8080` | OpenCode web | 4096 |
+| `http://<name>-term.localhost:8080` | ttyd terminal | 8082 |
 
-```bash
-BRIDGE=$(ifconfig | grep -B1 "192.168.64" | head -1 | awk '{print $1}' | sed 's/:$//')
-sudo route -n add -net 192.168.64.0/24 -interface "$BRIDGE"
+**How it works — socat tunnel (no host ports):**
+
+Instead of publishing ports, the portal creates a bidirectional tunnel per HTTP connection:
+
 ```
+browser → agent-vm web (8080) → container exec -i <name> socat - TCP:127.0.0.1:<port>
+```
+
+Each connection spawns a `container exec` + `socat` process that pipes traffic directly into the container. The standard library's `httputil.ReverseProxy` handles HTTP, WebSocket, and binary data transparently.
+
+**Auto-start:** If a service (OpenCode web or ttyd) isn't running inside a container, the portal starts it automatically on first access.
+
+**Mobile terminal:** ttyd's xterm.js provides on-screen Ctrl, Tab, Esc, arrow keys — works on iPad virtual keyboards. Bluetooth keyboards work natively.
+
+## CLI Reference
+
+| Command | Description |
+|---|---|
+| `build` | Build the `kata-dev` container image |
+| `start [name]` | Start a container and attach; if already running, just attach |
+| `stop [name]` | Stop a running container |
+| `restart [name]` | Stop, then start and attach |
+| `list` | List agent-vm managed containers (aliases: `status`, `ls`) |
+| `web` | Start the web portal (OpenCode web + terminal) |
+| `destroy [name]` | Remove a container and its state |
+
+### Flags
+
+| Flag | Commands | Default | Description |
+|---|---|---|---|
+| `-n, --name` | start, stop, restart, destroy | `dev` | Container name |
+| `-c, --cpus` | start, restart | `6` | Number of CPUs |
+| `-w, --workspace` | start, restart | *(see note)* | Host folder to mount at `/home/vm/workspace` |
+| `-d, --detach` | start | `false` | Start without attaching |
+| `-g, --go-version` | build | *(from Dockerfile)* | Go version to install in the image |
+| `-p, --port` | web | `8080` | Portal port |
+
+> **Workspace default:** when omitted, `start` reuses the workspace from the previous start. On first start it defaults to the current directory.
+
+## State
+
+Container state is persisted in `~/.config/agent-vm/`:
+
+```
+<name>.workspace    # host workspace path (for working directory resolution)
+```
+
+Only containers started via `agent-vm` are tracked. The `list` command and web portal scan this directory — containers created directly with the `container` CLI are invisible.
+
+## What's Inside the Image
+
+The image (`kata-dev`) is built from a single self-contained `Dockerfile`:
+
+- **Languages:** Go (system-wide), Node.js LTS (via fnm), Rust, Python (via uv)
+- **Package managers:** pnpm, Homebrew (Linuxbrew), Cargo
+- **Browser automation:** Playwright + Chromium (with all required system libraries)
+- **Containers:** Podman (rootless, fully isolated via fuse-overlayfs)
+- **Web terminal:** ttyd (via Homebrew) — serves xterm.js in the browser
+- **AI coding:** opencode
+- **Shell:** zsh with dev tools PATH configured in `~/.zshrc`
+- **Utilities:** socat (for web portal tunneling), git, curl, wget, build-essential
 
 ## Code Layout
 
 ```
-cmd/agent-vm/main.go              CLI entry point
-internal/vmctl/
-  config.go / yaml_config.go      config loading and YAML schema
-  vm.go / build_vfkit.go          VM lifecycle and disk builder
-  util.go / bootstrap_script.go   helpers and bootstrap generator
-  web.go / web_handlers.go        Echo v5 web server + REST API
-  sync_*.go / tunnel_*.go         sync pair and tunnel management
-web/static/                       embedded web UI
-scripts/e2e-test.sh               end-to-end test
+main.go         entry point
+commands.go     cobra subcommand definitions
+container.go    container lifecycle + service management
+web.go          web portal + socat tunnel reverse proxy
+util.go         helpers (signal forwarding, CLI checks)
+embed.go        embeds Dockerfile into the binary
+Dockerfile      self-contained image definition (Ubuntu 22.04 + zsh)
 ```
+
+All files are in `package main` at the module root — no sub-packages. See [docs/specs.md](docs/specs.md) for the full architecture specification.

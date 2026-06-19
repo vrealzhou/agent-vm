@@ -1,6 +1,6 @@
-package agentvm
+package main
 
-import "embed"
+import _ "embed"
 
-//go:embed web/static
-var WebStatic embed.FS
+//go:embed Dockerfile
+var kataDockerfile string

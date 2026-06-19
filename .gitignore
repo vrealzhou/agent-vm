@@ -3,3 +3,8 @@
 .DS_Store
 /vmctl
 agent-vm
+node_modules/
+pnpm-lock.yaml
+package.json
+pnpm-workspace.yaml
+commands

@@ -1,5 +1,22 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* FiraCode Nerd Font Mono — served at /fonts/* by the agent-vm web server
+   (see web.go serveFont). Falls back gracefully if the files are absent. */
+@font-face {
+    font-family: 'FiraCode Nerd Font Mono';
+    src: url('/fonts/FiraCodeNerdFontMono-Regular.ttf') format('truetype');
+    font-weight: 400 500;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'FiraCode Nerd Font Mono';
+    src: url('/fonts/FiraCodeNerdFontMono-Bold.ttf') format('truetype');
+    font-weight: 600 700;
+    font-style: normal;
+    font-display: swap;
+}
+
 :root {
     color-scheme: light dark;
     --bg-canvas: #ffffff;
@@ -157,7 +174,7 @@ body {
 }
 
 .progress-log {
-    font-family: 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
+    font-family: 'FiraCode Nerd Font Mono', 'SF Mono', 'Menlo', 'Monaco', 'Courier New', monospace;
     font-size: 11px;
     line-height: 1.6;
     min-height: 80px;
