@@ -1,7 +1,7 @@
 package network
 
 import (
-	"strings"
+	"strconv"
 
 	"github.com/vrealzhou/agent-vm/internal/config"
 )
@@ -10,7 +10,6 @@ import (
 // extraPublish are appended after config-file publish entries (CLI overrides).
 func NetworkConfigToRunArgs(cfg *config.NetworkConfig, extraPublish []string) []string {
 	if cfg == nil {
-		// Still apply CLI-only publish flags
 		var args []string
 		for _, p := range extraPublish {
 			args = append(args, "-p", p)
@@ -20,33 +19,26 @@ func NetworkConfigToRunArgs(cfg *config.NetworkConfig, extraPublish []string) []
 
 	var args []string
 
-	// Network name (with optional MTU)
 	if cfg.Network != "" {
 		netSpec := cfg.Network
 		if cfg.MTU > 0 {
-			netSpec += fmtMTU(cfg.MTU)
+			netSpec += ",mtu=" + strconv.Itoa(cfg.MTU)
 		}
 		args = append(args, "--network", netSpec)
 	} else if cfg.MTU > 0 {
-		args = append(args, "--network", "bridge"+fmtMTU(cfg.MTU))
+		args = append(args, "--network", "bridge,mtu="+strconv.Itoa(cfg.MTU))
 	}
 
-	// DNS servers
 	for _, dns := range cfg.DNS {
 		args = append(args, "--dns", dns)
 	}
-
-	// DNS search domains
 	for _, s := range cfg.DNSSearch {
 		args = append(args, "--dns-search", s)
 	}
-
-	// DNS domain
 	if cfg.DNSDomain != "" {
 		args = append(args, "--dns-domain", cfg.DNSDomain)
 	}
 
-	// Port publishing: config file first, then CLI overrides
 	for _, p := range cfg.Publish {
 		args = append(args, "-p", p)
 	}
@@ -55,30 +47,4 @@ func NetworkConfigToRunArgs(cfg *config.NetworkConfig, extraPublish []string) []
 	}
 
 	return args
-}
-
-func fmtMTU(mtu int) string {
-	return strings.Join([]string{"", "mtu=" + intToStr(mtu)}, ",")
-}
-
-func intToStr(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var buf [20]byte
-	pos := len(buf)
-	negative := i < 0
-	if negative {
-		i = -i
-	}
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if negative {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }

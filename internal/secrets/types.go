@@ -25,11 +25,8 @@ var BuiltinTypes = map[string]Type{
 		},
 	},
 	"header": {
-		Name: "header",
-		Fields: map[string]Field{
-			// headers is a special field: map[string]string stored as YAML
-			// All header values are secret
-		},
+		Name:   "header",
+		Fields: map[string]Field{},
 	},
 	"kafka-sasl": {
 		Name: "kafka-sasl",
@@ -43,7 +40,6 @@ var BuiltinTypes = map[string]Type{
 }
 
 // GetType returns the Type definition for a credential type name.
-// Returns nil if the type is unknown.
 func GetType(typeName string) *Type {
 	t, ok := BuiltinTypes[typeName]
 	if !ok {
@@ -56,50 +52,11 @@ func GetType(typeName string) *Type {
 func IsSecretField(typeName, fieldName string) bool {
 	t := GetType(typeName)
 	if t == nil {
-		return true // unknown type: treat all as secret
+		return true
 	}
 	f, ok := t.Fields[fieldName]
 	if !ok {
-		return true // unknown field: treat as secret
+		return true
 	}
 	return f.Secret
-}
-
-// PlaintextFields returns field names that are safe to expose to the container.
-func PlaintextFields(typeName string) []string {
-	t := GetType(typeName)
-	if t == nil {
-		return nil
-	}
-	var result []string
-	for name, f := range t.Fields {
-		if !f.Secret {
-			result = append(result, name)
-		}
-	}
-	return result
-}
-
-// SecretFields returns field names that are proxy-only.
-func SecretFields(typeName string) []string {
-	t := GetType(typeName)
-	if t == nil {
-		return nil
-	}
-	var result []string
-	for name, f := range t.Fields {
-		if f.Secret {
-			result = append(result, name)
-		}
-	}
-	return result
-}
-
-// TypeNames returns all registered type names.
-func TypeNames() []string {
-	var names []string
-	for name := range BuiltinTypes {
-		names = append(names, name)
-	}
-	return names
 }
