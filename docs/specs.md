@@ -1,241 +1,261 @@
 # Agent VM Spec
 
-Updated: 2026-05-05
+Updated: 2026-06-15
 
 ## 1. Goal
 
-Provide a single-command, reproducible `arm64` Linux development VM on Apple Silicon macOS using `vfkit`.
+Provide a single-command, reproducible development environment using Apple's native Container framework on macOS 26+.
 
-- Distribution: `Void Linux aarch64 glibc`
-- Desktop: `Sway` (configurable)
-- Fixed IP: `192.168.64.10`
-- SSH target: `ssh vm@192.168.64.10`
-- Default user: `vm`
-- Default resources: `6 CPU / 6 GiB RAM / 100 GiB disk`
-- Entry point: `go run ./cmd/agent-vm start`
-- Config: `~/.config/agent-vm/vmctl.yaml` (YAML)
+- Base image: `Ubuntu 22.04` (arm64)
+- Runtime: Apple Container CLI (`container`) with `--virtualization` (lightweight VM per container)
+- Default user: `vm` (passwordless sudo), shell: `/usr/bin/zsh`
+- Default resources: 6 CPU / 6 GiB RAM
+- Single Go binary, flat package structure (no sub-packages)
+- CLI: `agent-vm build && agent-vm start`
+- Web portal: `agent-vm web` (OpenCode web + ttyd terminal)
 
-Expected outcome:
-
-- first boot downloads, builds, boots, and bootstraps automatically
-- later boots reuse the existing VM state
-- the codebase stays narrow, explicit, and rebuildable
-
-## 2. Project Boundary
-
-### 2.1 Supported Inputs
-
-The project supports only:
-
-1. The official Void `ROOTFS tarball`
-2. Existing disk images: `.img`, `.img.xz`, `.raw`, `.raw.xz`, `.qcow2`
-
-The default implementation:
-
-- download the official `ROOTFS`
-- build the disk offline on the host via vfkit (fallback: podman)
-- extract `vmlinuz` and `initramfs`
-- boot with `vfkit --kernel/--initrd`
-
-### 2.2 Unsupported Paths
-
-- installer ISO, cloud-init, interactive installers
-- board-firmware-oriented ARM images
-
-## 3. Configuration
-
-### 3.1 Config File
-
-All configuration lives in `~/.config/agent-vm/vmctl.yaml`. Override directory with `VMCTL_CONFIG_DIR`.
-
-The YAML schema is defined in `internal/vmctl/yaml_config.go`. Every key is optional — defaults apply for anything omitted.
-
-```yaml
-vm:
-  name: void-dev
-  cpus: 6
-  memory_mib: 6144
-  disk_size: "100G"
-  gui: true
-  width: 1920
-  height: 1200
-
-network:
-  static_ip: "192.168.64.10"
-  gateway: "192.168.64.1"
-  cidr: 24
-  dns_servers: ["1.1.1.1", "8.8.8.8"]
-  mac: "52:54:00:64:00:10"
-
-user:
-  name: vm
-  password: dev
-  root_password: root
-  ssh_public_key: ""          # blank = auto-detect ~/.ssh/id_ed25519.pub
-
-guest:
-  timezone: Australia/Sydney
-  default_shell: fish
-  default_editor: neovim
-  window_manager: sway
-
-bootstrap:
-  hook_scripts:
-    - ~/.config/agent-vm/hooks/install-rust.sh
-    - ~/.config/agent-vm/hooks/install-packages.sh
-
-git:
-  user_name: ""
-  user_email: ""
-
-sync:
-  - name: myproject
-    host_path: /Users/me/projects/myproject
-    target_path: /home/vm/myproject
-    mode: copy
-    direction: host-to-vm
-    exclude: [node_modules, .git]
-
-tunnels:
-  - name: webapp
-    type: local
-    local_port: 3000
-    remote_port: 3000
-    enabled: true
-    auto_start: true
-```
-
-### 3.2 Directory Layout
+## 2. Architecture Overview
 
 ```
-~/.config/agent-vm/
-├── vmctl.yaml
-├── scripts/
-│   └── guest-bootstrap.sh   # generated at bootstrap time
-├── images/                  # base Void rootfs tarballs
-└── void-dev/                # runtime state
-    ├── disk.img
-    ├── vmlinuz
-    ├── initramfs.img
-    ├── bootstrap.done
-    ├── vfkit.log / serial.log / vfkit.pid
+┌──────────────────────────────────────────────────────────┐
+│  Host (macOS 26+)                                        │
+│                                                          │
+│  agent-vm web (port 8080)                                │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  Portal page (/, lists containers)                  │  │
+│  │  API (/api/containers, /api/containers/<n>/start-*) │  │
+│  │  Reverse proxy (subdomain-based routing)            │  │
+│  └──────────────┬───────────────┬─────────────────────┘  │
+│                 │               │                         │
+│     <name>.localhost     <name>-term.localhost            │
+│         → port 4096          → port 8082                  │
+│                 │               │                         │
+│          ┌──────┴───────┐────────┴───────┐                │
+│          │  socat tunnel │  socat tunnel  │                │
+│          │  (per HTTP    │  (per HTTP     │                │
+│          │   connection) │   connection)  │                │
+│          └──────┬───────┴────────┬───────┘                │
+│                 │               │                         │
+│  ═══════════════╪═══════════════╪══════════════════════   │
+│  Container "dev"│               │                         │
+│  ┌──────────────┴───────────────┴─────────────────────┐  │
+│  │  OpenCode web (:4096)    ttyd (:8082)              │  │
+│  │  zsh, Go, Node, Rust, Python, ...                  │  │
+│  └────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
 ```
 
-## 4. Bootstrap
+### 2.1 No Host Ports
 
-### 4.1 Bootstrap Flow
+Containers are started with **no published ports**. The host web portal accesses
+container-internal services through a **socat tunnel** — each HTTP/WebSocket
+connection spawns `container exec -i <name> socat - TCP:127.0.0.1:<port>`,
+giving the host process a bidirectional pipe directly into the container.
 
-Bootstrap runs automatically on first boot. It is a shell script generated from `internal/vmctl/bootstrap_script.go` and written to `~/.config/agent-vm/scripts/guest-bootstrap.sh` at bootstrap time.
+This means:
+- A single host port (default 8080) serves all containers
+- No port allocation or collision management
+- No `-p` flag needed on `container run`
 
-Bootstrap completion is tracked by a `bootstrap.done` marker. Subsequent VM starts skip bootstrap.
+### 2.2 Subdomain Routing
 
-### 4.2 Bootstrap Scope
+The portal routes based on the `Host` header:
 
-The agent-vm bootstrap installs only essential infrastructure:
-- Homebrew for Linux
-- Docker with docker-compose and docker-buildx plugins
-- Selected shell (fish/zsh), editor (neovim/helix), and window manager (sway/xfce)
-- Rust toolchain (rustup + stable), fnm + Node.js, Starship prompt
-- Browsers (Chromium, Zen Browser)
-- Fcitx5 Chinese input, Ghostty terminal
+| Subdomain | Target | Port |
+|---|---|---|
+| `<name>.localhost:8080` | OpenCode web | 4096 |
+| `<name>-term.localhost:8080` | ttyd terminal | 8082 |
 
-All other developer tools (zellij, zig, lazygit, gitui, opencode, cargo crates, etc.) should be installed via user-provided hook scripts.
+`*.localhost` resolves to `127.0.0.1` on macOS/Linux, so no DNS setup needed.
 
-### 4.3 Post-Bootstrap Hook Scripts
+### 2.3 Auto-Start
 
-- **hook_scripts**: YAML list of paths to shell scripts on the host. Each file is read and its content is appended and executed as a post-bootstrap hook inside the guest. These do not run on subsequent VM restarts.
-- CLI: `agent-vm bootstrap --hook script1.sh --hook script2.sh` (repeatable `--hook` flag)
+When a request arrives for a container service that isn't running yet, the
+portal starts it automatically:
 
-## 5. Boot And System Behavior
+1. Check if the port is listening inside the container (`/dev/tcp` probe)
+2. If not, run `container exec -u vm <name> bash -lc 'nohup <cmd> &'` using **absolute binary paths** (the non-interactive `bash -lc` does not source `~/.zshrc`, so PATH-based lookup is unreliable) and any required env vars (e.g. `BROWSER=/bin/true` for opencode web — see §5)
+3. Poll until the port responds (up to 15 seconds)
+4. If still not ready, read `/tmp/<label>.log` from inside the container and include its contents in the error response — so the actual failure reason (missing dep, crash, etc.) is surfaced instead of an opaque timeout
+5. Proxy the original request
 
-### 5.1 First Boot
+## 3. Container Lifecycle
 
-Running `go run ./cmd/agent-vm start` must automatically:
+### 3.1 Build
 
-1. download the official Void rootfs into `~/.config/agent-vm/images/`
-2. build a raw disk via vfkit (or podman fallback)
-3. write users, networking, SSH, GUI, and system config offline
-4. extract `vmlinuz` and `initramfs`
-5. start the VM
-6. wait for SSH and run bootstrap once
+`agent-vm build` writes the embedded Dockerfile to a temp directory and runs
+`container build -t kata-dev <tmpdir>`.
 
-### 5.2 Later Boots
+### 3.2 Start / Attach
 
-If the disk and boot assets already exist:
+`agent-vm start` merges start + exec:
+1. If container is already running → skip creation, exec directly
+2. If not → create with `container run -d --virtualization`, then exec
 
-- boot directly into the existing VM
-- do not rerun bootstrap
+The workspace host path is persisted in state. On subsequent `start` calls
+without `-w`, the stored path is reused. The container working directory is
+resolved relative to the current host directory — if you're in a subfolder of
+the workspace, the shell opens at the matching subfolder inside the container.
 
-## 6. Users, Login, And GUI
+### 3.3 Managed Containers Only
 
-### 6.1 Default Accounts
+Only containers started via `agent-vm` are tracked (identified by `.workspace`
+state files). The `list` command and web portal only show managed containers.
+Containers created directly via the `container` CLI are invisible to agent-vm.
 
-- User: `vm` / password: `dev`
-- Root: `root` / password: `root`
-- SSH key: auto-detected from `~/.ssh/id_ed25519.pub`; override via `user.ssh_public_key` in YAML
+## 4. Web Portal
 
-### 6.2 SSH
+### 4.1 Portal Page
 
-```bash
-ssh vm@192.168.64.10
+Served at `http://localhost:8080/`. Lists all managed containers with:
+- Running/stopped status
+- OpenCode web status (running/idle)
+- Terminal status (running/idle)
+- **OpenCode** button — starts opencode web, opens `<name>.localhost`
+- **Terminal** button — starts ttyd, opens `<name>-term.localhost`
+
+Auto-refreshes every 3 seconds via `GET /api/containers`.
+
+### 4.2 API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/containers` | JSON list of containers with status |
+| POST | `/api/containers/<name>/start-web` | Ensure OpenCode web is running |
+| POST | `/api/containers/<name>/start-terminal` | Ensure ttyd is running |
+
+### 4.3 Reverse Proxy Implementation
+
+Uses `httputil.NewSingleHostReverseProxy` from the standard library with a
+custom `http.Transport`:
+
+```go
+proxy.Transport = &http.Transport{
+    DialContext: func(ctx, network, addr) (net.Conn, error) {
+        return dialContainer(ctx, name, port)  // spawns socat
+    },
+}
 ```
 
-### 6.3 GUI Session
+`dialContainer` creates a `pipeConn` (implements `net.Conn`) wrapping the
+stdin/stdout pipes of `container exec -i <name> socat - TCP:127.0.0.1:<port>`.
 
-- `tty1 autologin -> vm -> sway` (or configured WM)
-- Boot directly into the user desktop session without a display manager
-- `gui: false` in YAML boots headless (no display window, no keyboard/mouse/GPU)
+The standard library's `ReverseProxy` handles:
+- HTTP requests and responses (streaming, not buffered)
+- WebSocket upgrades (bidirectional copy after 101)
+- Binary data (OS pipes are 8-bit clean)
+- Connection pooling via keep-alive (one socat per pooled connection)
 
-## 7. Networking
+## 5. OpenCode Web
 
-- `vfkit` NAT
-- Guest fixed IP: `192.168.64.10/24`
-- Default gateway: `192.168.64.1`
-- Fixed IP binds to virtual NIC MAC address
+### 5.1 Purpose
 
-## 8. Sync
+Provides the AI coding agent's browser interface inside the container.
+Runs on port 4096.
 
-File sync between host and VM, configured in `vmctl.yaml` under `sync:` or via CLI/web UI.
+### 5.2 Start Command
 
-**copy** mode: rsync with configurable backups.
-**git** mode: creates a bare repo on the VM, adds a `vm` remote on the host. Host pushes/pulls via `git push vm` / `git pull vm`. The VM target directory is cloned from the bare repo.
+```
+env BROWSER=/bin/true /home/vm/.opencode/bin/opencode web --port 4096 --hostname 0.0.0.0
+```
 
-## 9. Tunnels
+- `BROWSER=/bin/true` — `opencode web` normally auto-opens the user's
+  browser after starting the server. The container is headless (no
+  browser, no `DISPLAY`), so this would hang. The `open` npm package
+  honors `BROWSER` as the browser command; `/bin/true` is a no-op that
+  returns immediately.
+- Absolute path `/home/vm/.opencode/bin/opencode` — avoids relying on
+  PATH being set up in the non-interactive login shell that
+  `ensureService` uses.
+- `--port 4096` — fixed port for the socat tunnel.
+- `--hostname 0.0.0.0` — binds to all interfaces so the service is
+  reachable via the socat tunnel to `127.0.0.1:4096`.
 
-SSH port forwarding managed under `tunnels:` in `vmctl.yaml`. Supports local and remote forwarding with auto-start on VM boot.
+## 6. ttyd Web Terminal
 
-## 10. Web UI
+### 6.1 Purpose
 
-Running `go run ./cmd/agent-vm` without a subcommand starts the web UI on port 8080 (`VM_MANAGER_PORT`).
+Provides a browser-based terminal for the container. Uses **ttyd** (single C
+binary) with **xterm.js** frontend. Runs on port 8082 inside the container.
 
-The UI provides:
-- Bootstrap configuration (shell, editor, WM, hook scripts, git identity)
-- VM start/stop/destroy with progress streaming
-- Guest CPU/memory metrics
-- Sync pair management
-- Tunnel management
+### 6.2 Mobile Support
 
-## 11. Guest Software Set
+ttyd's xterm.js provides on-screen special keys for touch devices:
+- Ctrl, Alt, Shift modifiers
+- Tab, Esc, arrow keys
+- Customizable key bar
 
-### 11.1 Base System
+Bluetooth keyboards work natively without any special handling.
 
-- `linux6.12`, `dracut`, `NetworkManager`, `dbus`, `openssh`, `curl`, `wget`, `git`, `sudo`, `chrony`
+### 6.3 Start Command
 
-### 11.2 GUI And Desktop
+```
+/home/linuxbrew/.linuxbrew/bin/ttyd --port 8082 -W -t fontSize=14 zsh
+```
 
-- `sway` (or `xfce`), `seatd`, `ghostty`, `wofi`, `mako`, `grim`, `slurp`, `wl-clipboard`, `xdg-desktop-portal-wlr`, `mesa`, `mesa-dri`
+- Absolute path `/home/linuxbrew/.linuxbrew/bin/ttyd` — no PATH dependency.
+- `-W`: read-write (allow input)
+- `-t fontSize=14`: terminal font size
+- `zsh`: default shell
 
-### 11.3 Development Environment
+## 7. Image Contents
 
-- `fish` or `zsh`, `starship`, `neovim` or `helix`, `rustup`, Homebrew for Linux, `zellij`, `zig`, `fnm`, `opencode`, `lazygit`, `gitui`, cargo packages
+Built from a single self-contained `Dockerfile` (no external scripts):
 
-## 12. Acceptance Criteria
+| Layer | Contents |
+|---|---|
+| System | curl, wget, git, build-essential, socat, zsh, podman (rootless) |
+| Browser deps | libnss3, libgbm1, libatk, libpango, fonts-liberation, ... |
+| Go | System-wide (`/usr/local/go`), configurable version via `--build-arg` |
+| fnm + Node.js | LTS via fnm, pnpm via corepack |
+| Playwright | Global pnpm package + Chromium browser |
+| Rust | Via rustup |
+| Python | Via uv |
+| opencode | AI coding agent |
+| Homebrew | Linuxbrew for additional packages |
+| ttyd | Web terminal (via Homebrew) |
+| Shell profile | Dev tools PATH in `~/.dev-tools.sh`, sourced from both `~/.zshrc` (interactive zsh) and `~/.profile` (login bash) |
 
-1. `go run ./cmd/agent-vm start` completes download, disk build, and boot
-2. The GUI automatically enters the configured desktop session
-3. The host can `ssh vm@192.168.64.10`
-4. `bootstrap.done` prevents an unexpected second bootstrap
-5. `fish/zsh`, `ghostty`, Rust, Homebrew, Helix/Neovim, Zellij, Zig, Chromium, Zen Browser, and Fcitx5 are all present
-6. Post-bootstrap hooks execute once and not on restart
-7. Sync pairs and tunnels persist in `vmctl.yaml`
-8. Web UI reflects config changes without server restart
+## 8. State
+
+All state in `~/.config/agent-vm/`:
+
+```
+<name>.workspace    # host workspace path (for working directory resolution)
+```
+
+No port files, no PID files, no YAML config. Container state is derived from
+the `container` CLI at runtime.
+
+## 9. CLI Commands
+
+| Command | Description |
+|---|---|
+| `build` | Build the kata-dev image |
+| `start [name]` | Start container and attach; if running, just attach |
+| `stop [name]` | Stop a running container |
+| `restart [name]` | Stop, then start and attach |
+| `list` | List managed containers (aliases: status, ls) |
+| `web` | Start web portal |
+| `destroy [name]` | Remove container and state |
+
+## 10. Code Layout
+
+```
+main.go         entry point
+commands.go     cobra subcommand definitions
+container.go    container lifecycle (build, start, exec, stop, destroy, service mgmt)
+web.go          web portal + socat tunnel reverse proxy
+util.go         helpers (signal forwarding, CLI checks)
+embed.go        embeds Dockerfile
+Dockerfile      image definition (self-contained, no external scripts)
+```
+
+All files are in `package main` at the module root. No sub-packages.
+
+## 11. Limitations
+
+- **macOS 26+ only**: Requires Apple Container CLI (`container`)
+- **socat required in image**: The tunnel mechanism depends on socat being installed in the container
+- **One socat per connection**: Each HTTP/WebSocket connection spawns a `container exec` session. Amortized by keep-alive but adds overhead for many concurrent connections.
+- **No persistence**: Container state is not persisted across host reboots. Containers must be re-started with `agent-vm start`.
