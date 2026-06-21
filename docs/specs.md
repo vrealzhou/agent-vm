@@ -1,212 +1,216 @@
 # Agent VM Spec
 
-Updated: 2026-06-15
+Updated: 2026-06-22
 
 ## 1. Goal
 
-Provide a single-command, reproducible development environment using Apple's native Container framework on macOS 26+.
+Provide a single-command, reproducible development environment using Apple's native Container framework on macOS 26+ — with built-in credential proxy, Kafka SASL interception, and placeholder-based secret management.
 
-- Base image: `Ubuntu 22.04` (arm64)
+- Base image: `Debian 13` (arm64)
 - Runtime: Apple Container CLI (`container`) with `--virtualization` (lightweight VM per container)
 - Default user: `vm` (passwordless sudo), shell: `/usr/bin/zsh`
 - Default resources: 6 CPU / 6 GiB RAM
-- Single Go binary, flat package structure (no sub-packages)
-- CLI: `agent-vm build && agent-vm start`
-- Web portal: `agent-vm web` (OpenCode web + ttyd terminal)
+- CLI framework: urfave/cli v3
+- Modular Go packages under `internal/`
+- Credential proxy: MITM HTTPS interception + Kafka TCP SASL proxy
+- Secret management: placeholder system with type-based field visibility
 
 ## 2. Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  Host (macOS 26+)                                        │
-│                                                          │
-│  agent-vm web (port 8080)                                │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │  Portal page (/, lists containers)                  │  │
-│  │  API (/api/containers, /api/containers/<n>/start-*) │  │
-│  │  Reverse proxy (subdomain-based routing)            │  │
-│  └──────────────┬───────────────┬─────────────────────┘  │
-│                 │               │                         │
-│     <name>.localhost     <name>-term.localhost            │
-│         → port 4096          → port 8082                  │
-│                 │               │                         │
-│          ┌──────┴───────┐────────┴───────┐                │
-│          │  socat tunnel │  socat tunnel  │                │
-│          │  (per HTTP    │  (per HTTP     │                │
-│          │   connection) │   connection)  │                │
-│          └──────┬───────┴────────┬───────┘                │
-│                 │               │                         │
-│  ═══════════════╪═══════════════╪══════════════════════   │
-│  Container "dev"│               │                         │
-│  ┌──────────────┴───────────────┴─────────────────────┐  │
-│  │  OpenCode web (:4096)    ttyd (:8082)              │  │
-│  │  zsh, Go, Node, Rust, Python, ...                  │  │
-│  └────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  Host (macOS 26+)                                                │
+│                                                                  │
+│  agent-vm binary                                                 │
+│  ├─ CLI (urfave/cli v3)                                          │
+│  ├─ Web portal (:8080, socat tunnel reverse proxy)               │
+│  │                                                               │
+│  ├─ MITM Proxy daemon (per container)                            │
+│  │  ├─ CA cert generation (ECDSA P-256)                          │
+│  │  ├─ TLS interception for credential domains                   │
+│  │  ├─ Provider chain: header / body / aws-sigv4 / custom        │
+│  │  └─ Whitelist/blacklist access control                        │
+│  │                                                               │
+│  ├─ Credential server daemon (per container)                     │
+│  │  ├─ Env var forwarding (secrets.yaml → container .dev-tools)  │
+│  │  └─ Git/Docker credential helper protocol                     │
+│  │                                                               │
+│  └─ Kafka TCP proxy daemon (per container)                       │
+│     ├─ Binary frame parsing (API key 36 = SASL_AUTHENTICATE)     │
+│     └─ SASL/PLAIN credential replacement                         │
+│                                                                  │
+│  ══════════════════════════════════════════════════════════════════│
+│  Apple Container VM (lightweight Linux VM)                       │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │  socat bridges:                                             │  │
+│  │    :18080 → host:proxy_port    (HTTPS proxy)                │  │
+│  │    :18081 → host:cred_port     (credential server)          │  │
+│  │    :18082 → host:kafka_port    (Kafka proxy)                │  │
+│  │                                                             │  │
+│  │  HTTP_PROXY/HTTPS_PROXY → 127.0.0.1:18080                   │  │
+│  │  OpenCode web (:4096), ttyd (:8082)                         │  │
+│  │  zsh, Go, Node, Rust, Python, kafkacat, Podman, ...         │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.1 No Host Ports
+### 2.1 No Host Ports for Services
 
-Containers are started with **no published ports**. The host web portal accesses
-container-internal services through a **socat tunnel** — each HTTP/WebSocket
-connection spawns `container exec -i <name> socat - TCP:127.0.0.1:<port>`,
-giving the host process a bidirectional pipe directly into the container.
+Container services (OpenCode web, ttyd) are accessed through socat tunnels
+spawned per HTTP connection. A single host port (8080) serves all containers
+via subdomain-based routing.
 
-This means:
-- A single host port (default 8080) serves all containers
-- No port allocation or collision management
-- No `-p` flag needed on `container run`
+For credential proxies, socat bridges on fixed in-container ports (18080-18082)
+forward to host-side daemons via the auto-detected gateway IP.
 
-### 2.2 Subdomain Routing
+### 2.2 Gateway Detection
 
-The portal routes based on the `Host` header:
+The container init script detects the host gateway IP from `/proc/net/route`:
+
+```bash
+HEX=$(awk '$2=="00000000" {print $3; exit}' /proc/net/route)
+GW=$(printf "%d.%d.%d.%d" 0x${HEX:6:2} 0x${HEX:4:2} 0x${HEX:2:2} 0x${HEX:0:2})
+```
+
+Typically resolves to `192.168.64.1` for Apple Container VMs.
+
+## 3. Credential Proxy System
+
+### 3.1 MITM HTTPS Proxy
+
+For domains with configured credentials, the proxy performs TLS interception:
+
+1. Client sends `CONNECT host:443` through the HTTP proxy
+2. Proxy generates a leaf certificate signed by the proxy CA
+3. TLS handshake with client (client trusts CA, installed in container)
+4. Proxy decrypts HTTP requests, injects credentials, re-encrypts, forwards
+5. For non-credential domains: transparent CONNECT tunnel (no interception)
+
+The CA certificate is generated on first use (ECDSA P-256, 10-year validity),
+stored in `~/.config/agent-vm/proxy-ca.crt` (PEM) and `proxy-ca.key` (DER).
+At container startup, the CA cert is installed via `update-ca-certificates`.
+
+### 3.2 Credential Providers
+
+Pluggable provider interface:
+
+```go
+type CredentialProvider interface {
+    Transform(req *http.Request) error
+}
+```
+
+Built-in providers:
+- **header** — inject HTTP headers (e.g., Authorization: Bearer xxx)
+- **body** — modify JSON body fields (dot-path notation)
+- **aws-sigv4** — full AWS SigV4 request signing (HMAC-SHA256)
+
+Custom providers registered via `proxy.RegisterProvider(name, factory)`.
+
+### 3.3 Placeholder System
+
+Named credentials stored in global `secrets.yaml`:
+
+```yaml
+placeholders:
+  aws-prod:
+    type: aws-sigv4
+    fields:
+      access_key: AKIAIOSFODNN7EXAMPLE    # plaintext → enters container
+      secret_key: wJalrXUtnFEMI/...        # secret → proxy only
+      region: us-east-1
+      service: s3
+```
+
+`proxy.yaml` references placeholders by name:
+
+```yaml
+providers:
+  "*.amazonaws.com":
+    placeholder: aws-prod
+```
+
+Field visibility is predefined per credential type. Plaintext fields are
+forwarded to the container as environment variables. Secret fields are only
+available to the proxy for signing/injection.
+
+### 3.4 Kafka TCP SASL Proxy
+
+For non-HTTP protocols, a separate TCP proxy intercepts Kafka binary frames:
+
+1. Client connects to proxy via socat bridge (port 18082)
+2. Proxy connects to real broker
+3. For each client→broker frame:
+   - API key 17 (SASL_HANDSHAKE) → transparent passthrough
+   - API key 36 (SASL_AUTHENTICATE) → replace `\0username\0password` with real credentials, recompute frame length
+   - All other frames → transparent passthrough
+4. Broker→client direction: transparent `io.Copy`
+
+Supports optional TLS to the real broker (SASL_SSL).
+
+### 3.5 Credential Forwarding (non-proxy)
+
+For tools that use credential helpers (git, docker) or environment variables:
+
+- **Git**: `git-credential-agentvm` helper installed, queries credential server via socat
+- **Env vars**: `secrets.yaml` `env:` section forwarded to container's `.dev-tools.sh`
+- **Credential server**: TCP daemon on host, accessible via socat bridge (port 18081)
+
+### 3.6 Access Control
+
+- **Whitelist**: if set, only matching domains/URL-prefixes are allowed
+- **Blacklist**: if no whitelist, matching domains are blocked
+- Matching: exact domain, wildcard (`*.example.com`), URL prefix (`https://api.example.com/v1/`)
+
+## 4. Container Lifecycle
+
+### 4.1 Build
+
+`agent-vm build` writes the embedded Dockerfile to a temp directory and runs
+`container build -t kata-dev <tmpdir>`.
+
+### 4.2 Start
+
+`agent-vm start` performs:
+1. Start MITM proxy daemon (if proxy.yaml exists)
+2. Start credential server daemon (if secrets.yaml exists)
+3. Start Kafka proxy daemon (if kafka_proxy configured)
+4. Run `container run -d --virtualization` with init script
+5. Init script: install CA cert, detect gateway, start socat bridges, write env vars, install helpers
+6. Attach (unless `--detach`)
+
+### 4.3 Config Resolution
+
+Priority (high → low):
+1. CLI flags (`--profile`)
+2. Project: `./.agent-vm/proxy.yaml`
+3. Profile: `~/.config/agent-vm/profiles/<name>.yaml`
+4. Global: `~/.config/agent-vm/proxy.yaml`
+
+`secrets.yaml` is always global.
+
+## 5. Web Portal
+
+Served at `http://localhost:8080/`. Lists managed containers with status,
+provides browser-based OpenCode web and ttyd terminal access via socat
+tunnel reverse proxy with subdomain routing.
 
 | Subdomain | Target | Port |
 |---|---|---|
 | `<name>.localhost:8080` | OpenCode web | 4096 |
 | `<name>-term.localhost:8080` | ttyd terminal | 8082 |
 
-`*.localhost` resolves to `127.0.0.1` on macOS/Linux, so no DNS setup needed.
+## 6. Image Contents
 
-### 2.3 Auto-Start
-
-When a request arrives for a container service that isn't running yet, the
-portal starts it automatically:
-
-1. Check if the port is listening inside the container (`/dev/tcp` probe)
-2. If not, run `container exec -u vm <name> bash -lc 'nohup <cmd> &'` using **absolute binary paths** (the non-interactive `bash -lc` does not source `~/.zshrc`, so PATH-based lookup is unreliable) and any required env vars (e.g. `BROWSER=/bin/true` for opencode web — see §5)
-3. Poll until the port responds (up to 15 seconds)
-4. If still not ready, read `/tmp/<label>.log` from inside the container and include its contents in the error response — so the actual failure reason (missing dep, crash, etc.) is surfaced instead of an opaque timeout
-5. Proxy the original request
-
-## 3. Container Lifecycle
-
-### 3.1 Build
-
-`agent-vm build` writes the embedded Dockerfile to a temp directory and runs
-`container build -t kata-dev <tmpdir>`.
-
-### 3.2 Start / Attach
-
-`agent-vm start` merges start + exec:
-1. If container is already running → skip creation, exec directly
-2. If not → create with `container run -d --virtualization`, then exec
-
-The workspace host path is persisted in state. On subsequent `start` calls
-without `-w`, the stored path is reused. The container working directory is
-resolved relative to the current host directory — if you're in a subfolder of
-the workspace, the shell opens at the matching subfolder inside the container.
-
-### 3.3 Managed Containers Only
-
-Only containers started via `agent-vm` are tracked (identified by `.workspace`
-state files). The `list` command and web portal only show managed containers.
-Containers created directly via the `container` CLI are invisible to agent-vm.
-
-## 4. Web Portal
-
-### 4.1 Portal Page
-
-Served at `http://localhost:8080/`. Lists all managed containers with:
-- Running/stopped status
-- OpenCode web status (running/idle)
-- Terminal status (running/idle)
-- **OpenCode** button — starts opencode web, opens `<name>.localhost`
-- **Terminal** button — starts ttyd, opens `<name>-term.localhost`
-
-Auto-refreshes every 3 seconds via `GET /api/containers`.
-
-### 4.2 API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/containers` | JSON list of containers with status |
-| POST | `/api/containers/<name>/start-web` | Ensure OpenCode web is running |
-| POST | `/api/containers/<name>/start-terminal` | Ensure ttyd is running |
-
-### 4.3 Reverse Proxy Implementation
-
-Uses `httputil.NewSingleHostReverseProxy` from the standard library with a
-custom `http.Transport`:
-
-```go
-proxy.Transport = &http.Transport{
-    DialContext: func(ctx, network, addr) (net.Conn, error) {
-        return dialContainer(ctx, name, port)  // spawns socat
-    },
-}
-```
-
-`dialContainer` creates a `pipeConn` (implements `net.Conn`) wrapping the
-stdin/stdout pipes of `container exec -i <name> socat - TCP:127.0.0.1:<port>`.
-
-The standard library's `ReverseProxy` handles:
-- HTTP requests and responses (streaming, not buffered)
-- WebSocket upgrades (bidirectional copy after 101)
-- Binary data (OS pipes are 8-bit clean)
-- Connection pooling via keep-alive (one socat per pooled connection)
-
-## 5. OpenCode Web
-
-### 5.1 Purpose
-
-Provides the AI coding agent's browser interface inside the container.
-Runs on port 4096.
-
-### 5.2 Start Command
-
-```
-env BROWSER=/bin/true /home/vm/.opencode/bin/opencode web --port 4096 --hostname 0.0.0.0
-```
-
-- `BROWSER=/bin/true` — `opencode web` normally auto-opens the user's
-  browser after starting the server. The container is headless (no
-  browser, no `DISPLAY`), so this would hang. The `open` npm package
-  honors `BROWSER` as the browser command; `/bin/true` is a no-op that
-  returns immediately.
-- Absolute path `/home/vm/.opencode/bin/opencode` — avoids relying on
-  PATH being set up in the non-interactive login shell that
-  `ensureService` uses.
-- `--port 4096` — fixed port for the socat tunnel.
-- `--hostname 0.0.0.0` — binds to all interfaces so the service is
-  reachable via the socat tunnel to `127.0.0.1:4096`.
-
-## 6. ttyd Web Terminal
-
-### 6.1 Purpose
-
-Provides a browser-based terminal for the container. Uses **ttyd** (single C
-binary) with **xterm.js** frontend. Runs on port 8082 inside the container.
-
-### 6.2 Mobile Support
-
-ttyd's xterm.js provides on-screen special keys for touch devices:
-- Ctrl, Alt, Shift modifiers
-- Tab, Esc, arrow keys
-- Customizable key bar
-
-Bluetooth keyboards work natively without any special handling.
-
-### 6.3 Start Command
-
-```
-/home/linuxbrew/.linuxbrew/bin/ttyd --port 8082 -W -t fontSize=14 zsh
-```
-
-- Absolute path `/home/linuxbrew/.linuxbrew/bin/ttyd` — no PATH dependency.
-- `-W`: read-write (allow input)
-- `-t fontSize=14`: terminal font size
-- `zsh`: default shell
-
-## 7. Image Contents
-
-Built from a single self-contained `Dockerfile` (no external scripts):
+Built from a single self-contained `Dockerfile` (Debian 13):
 
 | Layer | Contents |
 |---|---|
-| System | curl, wget, git, build-essential, socat, zsh, podman (rootless) |
+| System | curl, wget, git, build-essential, socat, zsh, podman, neovim, htop, kafkacat |
 | Browser deps | libnss3, libgbm1, libatk, libpango, fonts-liberation, ... |
-| Go | System-wide (`/usr/local/go`), configurable version via `--build-arg` |
+| Locale | en_US.UTF-8, fonts-noto-cjk |
+| Font | Maple Mono NF CN (Nerd Font + CJK, from GitHub releases) |
+| Go | System-wide, configurable version via `--build-arg` |
 | fnm + Node.js | LTS via fnm, pnpm via corepack |
 | Playwright | Global pnpm package + Chromium browser |
 | Rust | Via rustup |
@@ -214,48 +218,71 @@ Built from a single self-contained `Dockerfile` (no external scripts):
 | opencode | AI coding agent |
 | Homebrew | Linuxbrew for additional packages |
 | ttyd | Web terminal (via Homebrew) |
-| Shell profile | Dev tools PATH in `~/.dev-tools.sh`, sourced from both `~/.zshrc` (interactive zsh) and `~/.profile` (login bash) |
+| Shell | zsh, dev tools PATH in `~/.dev-tools.sh`, sourced from `.zshrc` and `.profile` |
 
-## 8. State
-
-All state in `~/.config/agent-vm/`:
-
-```
-<name>.workspace    # host workspace path (for working directory resolution)
-```
-
-No port files, no PID files, no YAML config. Container state is derived from
-the `container` CLI at runtime.
-
-## 9. CLI Commands
+## 7. CLI Commands
 
 | Command | Description |
 |---|---|
 | `build` | Build the kata-dev image |
-| `start [name]` | Start container and attach; if running, just attach |
+| `start [name]` | Start container and attach |
 | `stop [name]` | Stop a running container |
 | `restart [name]` | Stop, then start and attach |
+| `exec [name]` | Attach to a running container |
 | `list` | List managed containers (aliases: status, ls) |
-| `web` | Start web portal |
 | `destroy [name]` | Remove container and state |
+| `web` | Start web portal |
+| `secrets add <name>` | Add a credential placeholder |
+| `secrets list` | List all placeholders |
+| `secrets remove <name>` | Remove a placeholder |
+| `secrets show <name>` | Show placeholder details |
 
-## 10. Code Layout
+## 8. Package Structure
 
 ```
-main.go         entry point
-commands.go     cobra subcommand definitions
-container.go    container lifecycle (build, start, exec, stop, destroy, service mgmt)
-web.go          web portal + socat tunnel reverse proxy
-util.go         helpers (signal forwarding, CLI checks)
-embed.go        embeds Dockerfile
-Dockerfile      image definition (self-contained, no external scripts)
+cmd/agent-vm/main.go              entry point (package main)
+
+internal/
+  config/      config types, YAML loading, multi-level path resolution
+  container/   container lifecycle, web portal, utilities
+  proxy/       MITM proxy server, credential providers, Kafka proxy, access control
+  credential/  credential forwarding (TCP server, env vars, git helper)
+  secrets/     placeholder store, credential type definitions
+  network/     network config → container run args
+  cli/         urfave/cli v3 command definitions
 ```
 
-All files are in `package main` at the module root. No sub-packages.
+Each package has clear boundaries. Cross-package communication via exported
+types and functions. Config types in `config/`, business logic in feature packages.
+
+## 9. State
+
+All state in `~/.config/agent-vm/`:
+
+```
+proxy.yaml            MITM proxy config (global)
+secrets.yaml          credential placeholders (global)
+network.yaml          network config (global)
+proxy-ca.crt          proxy CA certificate (PEM)
+proxy-ca.key          proxy CA private key (DER)
+.agent-vm/proxy.yaml  project-level proxy config
+profiles/<name>.yaml  named profiles
+<name>.workspace      host workspace path
+<name>.proxy.pid      proxy daemon PID
+<name>.cred.pid       credential server PID
+<name>.kafka.pid      kafka proxy PID
+```
+
+## 10. Testing
+
+- **Unit tests** (`go test -short ./...`): access control, provider logic, Kafka frame parsing, config resolution
+- **Integration tests** (`go test -tags integration .`): MITM header injection, AWS SigV4 signing, whitelist blocking, credential forwarding, git helper, Kafka SASL proxy, secrets workflow
 
 ## 11. Limitations
 
-- **macOS 26+ only**: Requires Apple Container CLI (`container`)
-- **socat required in image**: The tunnel mechanism depends on socat being installed in the container
-- **One socat per connection**: Each HTTP/WebSocket connection spawns a `container exec` session. Amortized by keep-alive but adds overhead for many concurrent connections.
-- **No persistence**: Container state is not persisted across host reboots. Containers must be re-started with `agent-vm start`.
+- **macOS 26+ only**: Requires Apple Container CLI
+- **socat required**: All proxy/credential bridges depend on socat in the container
+- **No GPU acceleration**: Desktop environments would run software-rendered only
+- **HTTP/2 downgraded to 1.1**: MITM proxy forces HTTP/1.1 via NextProtos
+- **Certificate pinning**: Apps with cert pinning reject the proxy's CA-signed certs
+- **Rootless podman inside container**: `newuidmap` not permitted (Apple Container kernel limitation)
