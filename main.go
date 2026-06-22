@@ -4,9 +4,14 @@ import (
 	"fmt"
 	"os"
 
+	_ "embed"
+
 	"github.com/vrealzhou/agent-vm/internal/cli"
 	"github.com/vrealzhou/agent-vm/internal/container"
 )
+
+//go:embed Dockerfile
+var kataDockerfile string
 
 func main() {
 	// The embedded Dockerfile lives in package main (//go:embed paths cannot

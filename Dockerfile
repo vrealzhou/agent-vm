@@ -1,12 +1,19 @@
 FROM debian:13
 
 ARG GO_VERSION=1.23.4
+ARG APT_MIRROR=""
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV SHELL=/usr/bin/zsh
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 ENV LANGUAGE=en_US:en
+
+# ── Optionally switch apt mirror (for company networks with DNS issues) ──
+RUN if [ -n "$APT_MIRROR" ]; then \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list 2>/dev/null || true; \
+    fi
 
 # ── System packages + Playwright chromium deps + podman (rootless) + socat + zsh + neovim + htop ──
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -48,14 +55,14 @@ RUN printf 'autoload -Uz compinit && compinit\n' > "$HOME/.zshrc"
 # ── fnm + Node.js LTS ──
 RUN export FNM_DIR="$HOME/.fnm" && \
     curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$FNM_DIR" && \
-    export PATH="$FNM_DIR:$PATH" && \
+    export PATH="$FNM_DIR:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" && \
     eval "$(fnm env --shell bash)" && \
     fnm install --lts && \
     fnm default lts-latest && \
     fnm use default
 
 # ── pnpm + Playwright ──
-RUN export PATH="$HOME/.fnm:$PATH" && \
+RUN export PATH="$HOME/.fnm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" && \
     eval "$(fnm env --shell bash)" && \
     corepack enable && \
     corepack prepare pnpm@latest --activate && \
@@ -85,9 +92,6 @@ RUN mkdir -p "$HOME/.config/containers" && \
     > "$HOME/.config/containers/storage.conf"
 
 # ── Dev tools env (sourced by both .zshrc and .profile) ──
-# Written to a shared file so interactive zsh (.zshrc) and login bash
-# (.profile) — used by `container exec ... bash -lc` for service startup —
-# both see the same PATH (ttyd, opencode, fnm, cargo, go, ...).
 RUN printf '%s\n' \
     '' \
     '# Dev tools PATH' \
