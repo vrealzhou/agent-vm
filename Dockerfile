@@ -1,7 +1,6 @@
 FROM debian:13
 
-ARG GO_VERSION=1.23.4
-ARG APT_MIRROR=""
+ARG GO_VERSION=1.26.4
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV SHELL=/usr/bin/zsh
@@ -22,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcups2t64 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
     libasound2t64 libatspi2.0-0t64 fonts-liberation fontconfig \
-    podman uidmap slirp4netns fuse-overlayfs \
+    podman passt uidmap slirp4netns fuse-overlayfs \
     socat zsh neovim htop kafkacat \
     locales fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* && \
@@ -33,6 +32,13 @@ RUN useradd -m -s /usr/bin/zsh vm && \
     echo "vm ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers && \
     echo "vm:100000:65536" > /etc/subuid && \
     echo "vm:100000:65536" > /etc/subgid
+
+# ── Rootless Podman: privilege the subuid/subgid helpers ──
+# File-capabilities on newuidmap/newgidmap don't stick / aren't enough
+# under this hypervisor's kernel (open of uid_map -> Permission denied),
+# so use the setuid bit, which makes them run as euid 0. Mode bits
+# survive into the image layer regardless of fs xattr support.
+RUN chmod u+s /usr/bin/newuidmap /usr/bin/newgidmap
 
 # ── Go (system-wide) ──
 RUN ARCH=$(dpkg --print-architecture) && \
@@ -46,6 +52,13 @@ RUN curl -fsSL -o /tmp/maple.zip \
     unzip -o /tmp/maple.zip -d /usr/share/fonts/truetype/maple-nf-cn && \
     rm /tmp/maple.zip && \
     fc-cache -f
+
+RUN printf '%s\n' \
+    '#!/bin/sh' \
+    'sudo mount --make-rshared / 2>/dev/null || echo "entrypoint: / not rshared (need --cap-add CAP_SYS_ADMIN)" >&2' \
+    'sudo chmod 666 /dev/net/tun 2>/dev/null || echo "entrypoint: could not chmod /dev/net/tun" >&2' \
+    'exec "$@"' \
+    > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 USER vm
 
@@ -89,7 +102,11 @@ RUN eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)" && brew install ttyd
 # ── Podman config (rootless) ──
 RUN mkdir -p "$HOME/.config/containers" && \
     printf '[storage]\ndriver = "fuse-overlayfs"\ngraphroot = "/home/vm/.local/share/containers/storage"\n' \
-    > "$HOME/.config/containers/storage.conf"
+    > "$HOME/.config/containers/storage.conf" && \
+    printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' \
+    > "$HOME/.config/containers/containers.conf" && \
+    printf 'unqualified-search-registries = ["docker.io"]\n' \
+    > "$HOME/.config/containers/registries.conf"
 
 # ── Dev tools env (sourced by both .zshrc and .profile) ──
 RUN printf '%s\n' \
@@ -104,6 +121,15 @@ RUN printf '%s\n' \
     printf '\n[ -f "$HOME/.dev-tools.sh" ] && . "$HOME/.dev-tools.sh"\n' >> "$HOME/.zshrc" && \
     printf '\n[ -f "$HOME/.dev-tools.sh" ] && . "$HOME/.dev-tools.sh"\n' >> "$HOME/.profile"
 
+RUN mkdir -p "$HOME/.config/containers" && \
+    printf '[storage]\ndriver = "overlay"\ngraphroot = "/home/vm/.local/share/containers/storage"\n' \
+    > "$HOME/.config/containers/storage.conf" && \
+    printf '[engine]\ncgroup_manager = "cgroupfs"\nevents_logger = "file"\n' \
+    > "$HOME/.config/containers/containers.conf" && \
+    printf 'unqualified-search-registries = ["docker.io"]\n' \
+    > "$HOME/.config/containers/registries.conf"
+
 WORKDIR /home/vm
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["sleep", "infinity"]
